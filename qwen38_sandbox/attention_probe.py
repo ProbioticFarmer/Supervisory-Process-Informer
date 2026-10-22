@@ -563,20 +563,52 @@ def _robust_normalize_01(values: List[float], eps: float = 1e-9) -> List[float]:
     return out
 
 
+def _rolling_local_zscore(
+    values: List[float],
+    half_window: int = 16,
+    eps: float = 1e-9,
+) -> List[float]:
+    """
+    Compute non-negative local rolling z-score `max(0, (x_i - mu_i) / (sigma_i + eps))`
+    within a sliding window `[i - half_window .. i + half_window]` so step onsets and
+    anchors are detected evenly across early, mid, and late positions of `<think>`.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    hw = max(1, int(half_window))
+    z_out: List[float] = []
+    for i in range(n):
+        lo = max(0, i - hw)
+        hi = min(n, i + hw + 1)
+        win = values[lo:hi]
+        m = sum(win) / len(win)
+        var = sum((x - m) ** 2 for x in win) / len(win)
+        std = var ** 0.5
+        if std <= eps or values[i] <= m:
+            z_out.append(0.0)
+        else:
+            z_out.append((values[i] - m) / (std + eps))
+    return z_out
+
+
 def compute_preplan_and_anchor_rhythm(
     attn_maps: Dict[int, mx.array],
     think_start_idx: int,
     query_offset: Optional[int] = None,
     window_w: int = 32,
-    horizon_lo: int = 2,
+    horizon_lo: int = 4,
     horizon_hi: int = 48,
+    min_horizon: int = 6,
+    rolling_half_window: int = 16,
     eps: float = 1e-9,
 ) -> Dict[str, Any]:
     """
     Compute task-agnostic Preplan (`WAAD_t`) and Anchor (`FAI_s`) structural rhythm telemetry
     across the `<think>` trace `[think_start_idx .. N-1]` from the captured 16-layer
     full-attention maps (`L = 16` layers, `H = 24` heads, total `384` heads), following
-    Li et al. ("Attention Illuminates LLM Reasoning: The Preplan-and-Anchor Rhythm").
+    Li et al. ("Attention Illuminates LLM Reasoning: The Preplan-and-Anchor Rhythm")
+    with scale-invariant, horizon-guarded corrections against tail bias:
 
     Steps:
       1. Sink-Free `<think>` Submatrix Normalization:
@@ -586,13 +618,22 @@ def compute_preplan_and_anchor_rhythm(
          Compute mean backward attention distance `d^{(l,h)}` for all `L * H` heads and
          partition at the median into Locally Focused Heads (`H_loc`, bottom 50%) and
          Globally Focused Heads (`H_glob`, top 50%).
-      3. Per-Token Preplan (`WAAD_i` & `Delta WAAD_i`) and Anchor (`FAI_j`) Scores:
-         - `WAAD_i = sum_{j=0}^i A_loc[i, j] * min(i - j, W)` (with `W = 32`)
-         - `Delta WAAD_i = |WAAD_i - WAAD_{min(i+1, M-1)}|`
-         - `FAI_j = (1 / |T(j)|) * sum_{i in T(j)} A_glob[i, j]` for `T(j) = [j + H_lo .. min(M-1, j + H_hi)]`
-         - Identify `peak_preplan_token_idx`, `peak_anchor_token_idx`, and coupled
-           `Preplan -> Anchor` junctures (top-quartile `preplan_score` followed within
-           `1..6` tokens by a top-quartile `anchor_score`).
+      3. Window-Capacity Normalized `WAAD` & Step-Onset Preplan Score:
+         - Divide raw `WAAD_i` by effective window capacity `max(1.0, min(i, W) / 2.0)`
+           so early `<think>` steps (`i < W`) are not penalized relative to late steps (`i >= W`).
+         - Combine capacity-normalized `WAAD_i` and forward transition jump
+           `Delta WAAD_i = |WAAD_cap[i] - WAAD_cap[min(i+1, M-1)]|` with `±16`-token local
+           rolling z-score normalization so Preplan onsets are detected evenly across the trace.
+      4. Scale-Invariant, Horizon-Guarded `FAI` (Anchor Score):
+         - Multiply each row `i` of `A_glob[i, j]` by `(i + 1)` (`A_hat_glob[i, j] = (i + 1) * A_glob[i, j]`)
+           to measure attention relative to a uniform `1/(i+1)` baseline, eliminating `1/i` dilution.
+         - Use `horizon_lo = 4` (excluding immediate subword/bigram recency) and damp tail tokens
+           where `|T(j)| < min_horizon` (`6`) by `|T(j)| / min_horizon` (and `0.0` when `|T(j)| == 0`).
+      5. Local Windowed Coupled-Juncture Detection (`coupled_junctures`):
+         - Detect coupled `Preplan -> Anchor` junctures where `p` is a local Preplan peak
+           (`preplan_score[p] >= 0.60` and local max within `±2` tokens) followed within
+           `a in [p+1 .. min(M-1, p+6)]` by `anchor_score[a] >= 0.55`, with a minimum spacing
+           of `4` tokens between consecutive coupled junctures.
     """
     if not attn_maps:
         return {
@@ -673,7 +714,6 @@ def compute_preplan_and_anchor_rhythm(
 
     # 2. Automatic Local vs. Global Head Classification via mean backward distance d^{(l,h)}
     dist_mat = mx.maximum(i_idx - j_idx, 0.0)  # (M, M)
-    # d^{(u)} = (1 / M) * sum_{i=0}^{M-1} sum_{j=0}^i a_tilde[u, i, j] * (i - j)
     head_distances_arr = mx.mean(mx.sum(a_tilde * dist_mat[None, :, :], axis=-1), axis=-1)  # (N_heads,)
     mx.eval(head_distances_arr)
     head_distances = [float(x) for x in head_distances_arr.tolist()]
@@ -689,74 +729,109 @@ def compute_preplan_and_anchor_rhythm(
     a_loc = mx.mean(a_tilde[mx.array(local_head_indices, dtype=mx.int32)], axis=0)  # (M, M)
     a_glob = mx.mean(a_tilde[mx.array(global_head_indices, dtype=mx.int32)], axis=0)  # (M, M)
 
-    # 3A. Compute Windowed Average Attention Distance (WAAD_i) & step-transition spike (Delta WAAD_i)
+    # 3A. Window-Capacity Normalized WAAD & Step-Onset Preplan Score
     win_dist_mat = mx.minimum(dist_mat, float(window_w))  # min(i - j, W)
     waad_arr = mx.sum(a_loc * win_dist_mat, axis=-1)  # (M,)
     mx.eval(waad_arr, a_glob)
     waad_raw = [float(x) for x in waad_arr.tolist()]
 
+    # Divide raw WAAD_i by effective window capacity max(1.0, min(i, W) / 2.0)
+    waad_cap: List[float] = [
+        waad_raw[i] / max(1.0, min(float(i), float(window_w)) / 2.0)
+        for i in range(m_len)
+    ]
+
     delta_waad_raw: List[float] = []
+    delta_waad_cap: List[float] = []
     for i in range(m_len):
         next_i = min(i + 1, m_len - 1)
         delta_waad_raw.append(abs(waad_raw[i] - waad_raw[next_i]))
+        delta_waad_cap.append(abs(waad_cap[i] - waad_cap[next_i]))
 
-    waad_norm = _robust_normalize_01(waad_raw, eps=eps)
-    delta_norm = _robust_normalize_01(delta_waad_raw, eps=eps)
-    combined_preplan = [0.65 * w_n + 0.35 * d_n for w_n, d_n in zip(waad_norm, delta_norm)]
+    onset_signal = [0.55 * w_c + 0.45 * d_c for w_c, d_c in zip(waad_cap, delta_waad_cap)]
+    onset_local_z = _rolling_local_zscore(onset_signal, half_window=rolling_half_window, eps=eps)
+    onset_z_norm = _robust_normalize_01(onset_local_z, eps=eps)
+    onset_glob_norm = _robust_normalize_01(onset_signal, eps=eps)
+    combined_preplan = [0.60 * z_n + 0.40 * g_n for z_n, g_n in zip(onset_z_norm, onset_glob_norm)]
     preplan_scores = _robust_normalize_01(combined_preplan, eps=eps)
 
-    # 3B. Compute Future Attention Influence (FAI_j — Anchor Score)
+    # 3B. Scale-Invariant, Horizon-Guarded FAI (Anchor Score)
+    # Multiply row i of A_glob[i, j] by (i + 1) to eliminate 1/i softmax dilution across depth
     a_glob_list: List[List[float]] = a_glob.tolist()
     fai_raw: List[float] = []
+    horizon_damping: List[float] = []
     h_lo = max(1, int(horizon_lo))
     h_hi = max(h_lo, int(horizon_hi))
+    min_h = max(1, int(min_horizon))
 
     for j in range(m_len):
         start_i = j + h_lo
         end_i = min(m_len - 1, j + h_hi)
         if start_i <= end_i:
             t_count = end_i - start_i + 1
-            col_sum = sum(a_glob_list[i][j] for i in range(start_i, end_i + 1))
-            fai_raw.append(float(col_sum / t_count))
+            damp = min(1.0, float(t_count) / float(min_h))
+            col_sum = sum(
+                (float(i + 1) * a_glob_list[i][j]) for i in range(start_i, end_i + 1)
+            )
+            fai_raw.append(float((col_sum / t_count) * damp))
+            horizon_damping.append(damp)
         else:
-            # Fallback for final tail tokens where [j + H_lo .. M-1] is empty
-            if j + 1 < m_len:
-                fai_raw.append(float(a_glob_list[j + 1][j]) * 0.25)
-            else:
-                fai_raw.append(0.0)
+            # |T(j)| == 0 -> FAI = 0.0 (no tail inflation!)
+            fai_raw.append(0.0)
+            horizon_damping.append(0.0)
 
-    anchor_scores = _robust_normalize_01(fai_raw, eps=eps)
+    fai_local_z = _rolling_local_zscore(fai_raw, half_window=rolling_half_window, eps=eps)
+    fai_z_norm = _robust_normalize_01(fai_local_z, eps=eps)
+    fai_glob_norm = _robust_normalize_01(fai_raw, eps=eps)
+    raw_anchor_blend = [
+        (0.55 * z_n + 0.45 * g_n) * damp
+        for z_n, g_n, damp in zip(fai_z_norm, fai_glob_norm, horizon_damping)
+    ]
+    anchor_scores = [
+        score * damp
+        for score, damp in zip(_robust_normalize_01(raw_anchor_blend, eps=eps), horizon_damping)
+    ]
 
-    # 4. Identify Peak Preplan Token, Peak Anchor Token, and Coupled Preplan -> Anchor Junctures
-    peak_preplan_rel = max(range(m_len), key=lambda i: preplan_scores[i])
-    peak_anchor_rel = max(range(m_len), key=lambda j: anchor_scores[j])
+    # 4. Identify Peak Preplan Token, Peak Anchor Token, and Local Windowed Coupled Junctures
+    peak_preplan_rel = max(range(m_len), key=lambda i: (preplan_scores[i], onset_signal[i]))
+    peak_anchor_rel = max(range(m_len), key=lambda j: (anchor_scores[j], fai_raw[j]))
     peak_preplan_token_idx = int(span_start + peak_preplan_rel)
     peak_anchor_token_idx = int(span_start + peak_anchor_rel)
-
-    sorted_pre = sorted(preplan_scores)
-    sorted_anc = sorted(anchor_scores)
-    q75_idx = min(m_len - 1, max(0, int(0.75 * (m_len - 1))))
-    pre_q75 = max(sorted_pre[q75_idx], 0.50) if m_len >= 4 else 0.50
-    anc_q75 = max(sorted_anc[q75_idx], 0.50) if m_len >= 4 else 0.50
 
     coupled_junctures: List[Dict[str, Any]] = []
     coupled_set = set()
     juncture_roles: Dict[int, str] = {}
+    last_coupled_p_rel = -999
+    last_coupled_a_rel = -999
 
     for p_rel in range(m_len):
-        if preplan_scores[p_rel] < pre_q75:
+        # Enforce minimum spacing of 4 tokens between consecutive coupled junctures
+        if p_rel - last_coupled_p_rel < 4:
             continue
-        # Check if p_rel is a local maximum or top-quartile onset followed within 1..6 tokens by an anchor peak
+        if preplan_scores[p_rel] < 0.60:
+            continue
+        # Must be a local maximum within ±2 tokens
+        loc_lo = max(0, p_rel - 2)
+        loc_hi = min(m_len - 1, p_rel + 2)
+        if any(preplan_scores[k] > preplan_scores[p_rel] + 1e-6 for k in range(loc_lo, loc_hi + 1) if k != p_rel):
+            continue
+
+        # Look ahead 1..6 tokens for the highest-scoring anchor with anchor_score[a] >= 0.55
         search_hi = min(m_len - 1, p_rel + 6)
         if p_rel + 1 > search_hi:
             continue
         best_a_rel: Optional[int] = None
         best_a_score = -1.0
         for a_rel in range(p_rel + 1, search_hi + 1):
-            if anchor_scores[a_rel] >= anc_q75 and anchor_scores[a_rel] > best_a_score:
+            if a_rel - last_coupled_a_rel < 4:
+                continue
+            if anchor_scores[a_rel] >= 0.55 and anchor_scores[a_rel] > best_a_score:
                 best_a_score = anchor_scores[a_rel]
                 best_a_rel = a_rel
+
         if best_a_rel is not None:
+            last_coupled_p_rel = p_rel
+            last_coupled_a_rel = best_a_rel
             p_abs = int(span_start + p_rel)
             a_abs = int(span_start + best_a_rel)
             coupled_junctures.append(

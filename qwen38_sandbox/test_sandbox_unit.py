@@ -1358,6 +1358,73 @@ class TestQwen38Sandbox(unittest.TestCase):
         self.assertIn(14, rhythm["coupled_token_indices"])
         self.assertIn(16, rhythm["coupled_token_indices"])
 
+        # 2. Regression Test: 120-token sequence with planted Preplan->Anchor transitions at
+        #    early (`i=15`), mid (`i=55`), and late (`i=90`) positions, plus recency noise at the tail (`i=115..119`).
+        m_long = 120
+        total_long = think_start_idx + m_long
+        planted_preplans = (15, 55, 90)
+        planted_anchors = (17, 57, 92)
+        long_attn: Dict[int, mx.array] = {}
+
+        for idx_l, l_idx in enumerate(FULL_ATTENTION_LAYERS_DEFAULT):
+            mat_np = np.zeros((1, n_heads_per_layer, m_long, total_long), dtype=np.float32)
+            is_local_layer = idx_l < 8
+            for i in range(m_long):
+                abs_i = think_start_idx + i
+                if is_local_layer:
+                    # Local head: at planted preplan onsets (15, 55, 90), reach back 14 tokens;
+                    # otherwise attend to self/immediate neighbor.
+                    if i in planted_preplans:
+                        back_j = max(0, i - 14)
+                        mat_np[:, :, i, think_start_idx + back_j] = 0.92
+                        mat_np[:, :, i, abs_i] = 0.08
+                    else:
+                        mat_np[:, :, i, abs_i] = 0.88
+                        if i > 0:
+                            mat_np[:, :, i, abs_i - 1] = 0.12
+                else:
+                    # Global head: simulate 1/(i+1) diluted causal baseline + strong future routing
+                    # to planted anchors (17, 57, 92) over their future windows, PLUS strong short-range
+                    # recency attention on the final tail tokens (115..119) to test the tail-horizon guard!
+                    mat_np[:, :, i, think_start_idx : abs_i + 1] = 0.25 / float(i + 1)
+                    if 21 <= i <= 38:
+                        mat_np[:, :, i, think_start_idx + 17] += 0.55
+                    elif 61 <= i <= 78:
+                        mat_np[:, :, i, think_start_idx + 57] += 0.55
+                    elif 96 <= i <= 112:
+                        mat_np[:, :, i, think_start_idx + 92] += 0.55
+                    elif i >= 115:
+                        # Tail tokens attending heavily to 2-3 tokens prior (recency trap)
+                        mat_np[:, :, i, think_start_idx + max(0, i - 2)] += 0.70
+            long_attn[l_idx] = mx.array(mat_np)
+
+        rhythm_long = compute_preplan_and_anchor_rhythm(
+            attn_maps=long_attn,
+            think_start_idx=think_start_idx,
+            query_offset=think_start_idx,
+        )
+        long_pairs = [
+            (j["preplan_idx"] - think_start_idx, j["anchor_idx"] - think_start_idx)
+            for j in rhythm_long["coupled_junctures"]
+        ]
+        # Verify early (15->17), mid (55->57), and late (90->92) junctures are detected!
+        self.assertIn((15, 17), long_pairs)
+        self.assertIn((55, 57), long_pairs)
+        self.assertIn((90, 92), long_pairs)
+
+        # Verify the final 5 tail tokens (`i=115..119`) are NOT artificially inflated in `anchor_scores`
+        # and do NOT produce any false coupled junctures at the tail!
+        tail_5_anchor_scores = rhythm_long["anchor_scores"][115:120]
+        for tail_s in tail_5_anchor_scores:
+            self.assertLess(
+                tail_s,
+                0.25,
+                f"Tail token anchor_score was artificially inflated: {tail_5_anchor_scores}",
+            )
+        for p_rel, a_rel in long_pairs:
+            self.assertLess(p_rel, 115)
+            self.assertLess(a_rel, 115)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
