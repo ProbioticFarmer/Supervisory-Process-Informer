@@ -1,0 +1,38 @@
+{
+  "providers": {
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com/v1",
+      "api": "openai-completions",
+      "apiKey": "${DEEPSEEK_API_KEY}",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "DeepSeek V3",
+          "contextWindow": 64000
+        },
+        {
+          "id": "deepseek-reasoner",
+          "name": "DeepSeek R1",
+          "contextWindow": 64000
+        }
+      ]
+    },
+    "swiftlm": {
+      "baseUrl": "http://127.0.0.1:9432/v1",
+      "api": "openai-completions",
+      "apiKey": "swiftlm-local",
+      "models": [
+        {
+          "id": "Qwen/Qwen3.6-27B",
+          "name": "Qwen 3.6 27B (SwiftLM Local)",
+          "contextWindow": 32768
+        },
+        {
+          "id": "qwen3.6-27b",
+          "name": "Qwen 3.6 27B (SwiftLM Local)",
+          "contextWindow": 32768
+        }
+      ]
+    }
+  }
+}

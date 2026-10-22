@@ -1,0 +1,10 @@
+{
+  "name": "pi-synde",
+  "version": "1.0.0",
+  "description": "Pi Agent with DeepSeek API & SwiftLM Local Models",
+  "type": "module",
+  "scripts": {
+    "pi": "node ./pi/packages/coding-agent/dist/cli.js",
+    "start:swiftlm": "bash ./scripts/start_swiftlm.sh"
+  }
+}

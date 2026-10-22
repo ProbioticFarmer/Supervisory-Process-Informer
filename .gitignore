@@ -1,0 +1,27 @@
+# macOS & Editor
+.DS_Store
+*.swp
+
+# Environment & Secrets
+.env
+
+# Python & UV virtual environments / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.uv-cache/
+.uv-python/
+qwen38_sandbox/.venv/
+qwen38_sandbox/.uv-cache/
+qwen38_sandbox/.uv-python/
+qwen38_sandbox/__pycache__/
+
+# Large local MLX model checkpoints (55.6 GB BF16 / 29.5 GB 8-bit)
+qwen38_sandbox/models/
+
+# Nested external repositories & caches
+SwiftLM/
+pi/
+npm-cache/
+node_modules/

@@ -1,0 +1,18 @@
+{
+  "peft_type": "LORA",
+  "task_type": "CAUSAL_LM",
+  "base_model_name_or_path": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "inference_mode": true,
+  "r": 1,
+  "lora_alpha": 1,
+  "lora_dropout": 0.0,
+  "bias": "none",
+  "fan_in_fan_out": false,
+  "use_rslora": false,
+  "init_lora_weights": true,
+  "target_modules": ["o_proj", "out_proj", "down_proj"],
+  "modules_to_save": null,
+  "layers_to_transform": null,
+  "layers_pattern": null
+}
