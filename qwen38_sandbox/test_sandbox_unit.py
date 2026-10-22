@@ -968,240 +968,395 @@ class TestQwen38Sandbox(unittest.TestCase):
              prefill of `prefix[:11] + edited_tokens` to `< 1e-5`!
         """
         from fastapi.testclient import TestClient
+        from attention_probe import compute_preplan_and_anchor_rhythm
         from harness_server import (
-             SandboxEngine,
+            SandboxEngine,
             SimpleFallbackTokenizer,
             create_harness_app,
         )
 
-        vectors = {
-            l: normalize_unit_vector(
-                mx.random.normal((HIDDEN_SIZE_DEFAULT,)), dtype=mx.bfloat16
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            spi_log_file = Path(tmp_dir) / "spi_traces.jsonl"
+
+            vectors = {
+                l: normalize_unit_vector(
+                    mx.random.normal((HIDDEN_SIZE_DEFAULT,)), dtype=mx.bfloat16
+                )
+                for l in range(1, NUM_LAYERS_DEFAULT)
+            }
+            projector = SubspaceProjector(
+                vectors=vectors,
+                alpha=0.0,
+                active_layers=range(10, 59),
+                enabled=False,
             )
-            for l in range(1, NUM_LAYERS_DEFAULT)
-        }
-        projector = SubspaceProjector(
-            vectors=vectors,
-            alpha=0.0,
-            active_layers=range(10, 59),
-            enabled=False,
-        )
-        tokenizer = SimpleFallbackTokenizer(vocab_size=256)
-        engine = SandboxEngine(
-            model=self.model,
-            tokenizer=tokenizer,
-            projector=projector,
-            model_id="Qwen3.8-27B-synthetic-test",
-            prefill_step_size=512,
-            snapshot_stride=8,
-        )
-        app = create_harness_app(engine)
-        client = TestClient(app)
-
-        # 1. Verify GET / Single-Page Workbench UI
-        r_root = client.get("/")
-        self.assertEqual(r_root.status_code, 200)
-        self.assertIn("Qwen3.8-27B Stateful", r_root.text)
-        self.assertIn("/api/prefill_and_probe", r_root.text)
-        self.assertIn("/api/fork_and_edit", r_root.text)
-
-        # 2. Verify GET /v1/models
-        r_models = client.get("/v1/models")
-        self.assertEqual(r_models.status_code, 200)
-        self.assertEqual(r_models.json()["data"][0]["id"], "Qwen3.8-27B-synthetic-test")
-
-        # 3. Verify POST /api/prefill_and_probe with stride-8 dense snapshotting
-        prompt_ids = [1, 2, 3, 4, 150, 151]  # think_start_idx = 6
-        think_ids = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]  # 18 tokens -> total 24
-        r_probe = client.post(
-            "/api/prefill_and_probe",
-            json={
-                "prompt_token_ids": prompt_ids,
-                "think_token_ids": think_ids,
-                "alpha": 0.0,
-                "snapshot_stride": 8,
-            },
-        )
-        self.assertEqual(r_probe.status_code, 200)
-        probe_data = r_probe.json()
-        self.assertEqual(probe_data["think_start_idx"], 6)
-        self.assertEqual(probe_data["total_tokens"], 24)
-        self.assertEqual(probe_data["snapshots"], [6, 14, 22, 24])
-        self.assertEqual(len(probe_data["tokens"]), 24)
-        self.assertIn("peak_spike_token", probe_data)
-        self.assertTrue(probe_data["peak_spike_token"]["is_think"])
-        self.assertEqual(
-            sorted(probe_data["tail_16_summary"]["per_head"].keys()),
-            ["L35.H21", "L39.H0", "L39.H1", "L43.H1", "L43.H7"],
-        )
-
-        # 4. Verify arbitrary-index stride-8 snapshot + delta replay exactness (< 1e-5)
-        # Fork at arbitrary token index 11 (between snapshot 6 and snapshot 14 -> 5 delta tokens replayed)
-        fork_idx = 11
-        edited_ids = [40, 41, 42, 43, 44, 45]
-        r_fork = client.post(
-            "/api/fork_and_edit",
-            json={
-                "fork_token_idx": fork_idx,
-                "edited_token_ids": edited_ids,
-                "alpha": 0.0,
-                "think_gated": True,
-                "max_new_tokens": 0,
-                "capture_probe": True,
-            },
-        )
-        self.assertEqual(r_fork.status_code, 200)
-        fork_data = r_fork.json()
-        self.assertEqual(fork_data["fork_token_idx"], 11)
-        self.assertEqual(fork_data["snapshot_restored_idx"], 6)
-        self.assertEqual(fork_data["delta_tokens_replayed"], 5)
-        self.assertEqual(fork_data["edited_tokens_count"], 6)
-        self.assertEqual(len(fork_data["edited_tokens"]), 6)
-
-        # Compare engine's hybrid cache state after stride-8 snapshot (at 6) + 5-token delta replay (to 11) + 6 edited tokens
-        # against a reference timeline with a direct snapshot at fork_idx=11
-        projector.detach(self.model)
-        clean_timeline = HybridTimelineCache(model=self.model, prefill_step_size=512)
-        _ = clean_timeline.prefill_with_snapshots(prompt_ids, snapshot_indices=[6])
-        _ = clean_timeline.prefill_with_snapshots(think_ids[:5], snapshot_indices=[fork_idx])
-        with capture_attention_maps(self.model):
-            _ = clean_timeline.fork_and_edit(edit_token_idx=fork_idx, new_token_ids=edited_ids)
-
-        for l_idx in engine.timeline.deltanet_layer_indices:
-            s_fork = engine.timeline.cache[l_idx][1]
-            s_clean = clean_timeline.cache[l_idx][1]
-            diff = float(mx.max(mx.abs(s_fork - s_clean)).item())
-            self.assertLess(
-                diff,
-                1e-5,
-                f"Stride-8 snapshot + delta replay DeltaNet state diverged at layer {l_idx}: {diff}",
+            tokenizer = SimpleFallbackTokenizer(vocab_size=256)
+            engine = SandboxEngine(
+                model=self.model,
+                tokenizer=tokenizer,
+                projector=projector,
+                model_id="Qwen3.8-27B-synthetic-test",
+                prefill_step_size=512,
+                snapshot_stride=8,
+                spi_log_path=spi_log_file,
             )
+            app = create_harness_app(engine)
+            client = TestClient(app)
 
-        for l_idx in engine.timeline.kv_layer_indices:
-            k_fork, v_fork = engine.timeline.cache[l_idx].keys_and_values()
-            k_clean, v_clean = clean_timeline.cache[l_idx].keys_and_values()
-            k_diff = float(
-                mx.max(mx.abs(k_fork.astype(mx.float32) - k_clean.astype(mx.float32))).item()
-            )
-            self.assertLess(k_diff, 1e-5)
+            # 1. Verify GET / Single-Page Workbench UI (including 4-mode Telemetry Heatmap bar & SPI Gold button)
+            r_root = client.get("/")
+            self.assertEqual(r_root.status_code, 200)
+            self.assertIn("Qwen3.8-27B Stateful", r_root.text)
+            self.assertIn("/api/prefill_and_probe", r_root.text)
+            self.assertIn("/api/fork_and_edit", r_root.text)
+            self.assertIn("Preplan Rhythm (WAAD Onsets)", r_root.text)
+            self.assertIn("Anchor Influence (FAI Hubs)", r_root.text)
+            self.assertIn("Mark as Gold SPI Pair", r_root.text)
 
-        # Re-attach projector for organic prefill, chained continuation fork, and chat completion tests
-        projector.attach(self.model)
+            # 2. Verify GET /v1/models
+            r_models = client.get("/v1/models")
+            self.assertEqual(r_models.status_code, 200)
+            self.assertEqual(r_models.json()["data"][0]["id"], "Qwen3.8-27B-synthetic-test")
 
-        # 5. Verify POST /api/prefill_and_probe in Organic Generation Mode (`clause_a_text=""`, `generate_organic_tokens=12`)
-        r_organic = client.post(
-            "/api/prefill_and_probe",
-            json={
-                "prompt_token_ids": prompt_ids,
-                "clause_a_text": "",
-                "generate_organic_tokens": 12,
-                "organic_alpha": 0.0,
-                "snapshot_stride": 8,
-            },
-        )
-        self.assertEqual(r_organic.status_code, 200)
-        org_data = r_organic.json()
-        self.assertTrue(org_data["organic_generated"])
-        self.assertEqual(org_data["think_start_idx"], 6)
-        self.assertEqual(org_data["think_tokens"], 12)
-        self.assertEqual(org_data["total_tokens"], 18)
-        # Stride-8 snapshots from think_start_idx=6 over 12 generated tokens -> [6, 14, 18]
-        self.assertEqual(org_data["snapshots"], [6, 14, 18])
-        self.assertEqual(len(org_data["tokens"]), 18)
-        for idx_i, tok_rec in enumerate(org_data["tokens"]):
-            self.assertEqual(tok_rec["token_idx"], idx_i)
-            self.assertIn("mean_lookback_score", tok_rec)
-
-        # 6. Verify POST /api/fork_and_edit returns clickable `continuation_tokens` with valid sequential `token_idx`
-        #    and lookback scores, AND supports a second chained `POST /api/fork_and_edit` inside `continuation_tokens`!
-        r_fork_cont = client.post(
-            "/api/fork_and_edit",
-            json={
-                "fork_token_idx": 11,
-                "edited_token_ids": [40, 41, 42, 43],
-                "alpha": 1.0,
-                "think_gated": True,
-                "max_new_tokens": 6,
-                "capture_probe": True,
-            },
-        )
-        self.assertEqual(r_fork_cont.status_code, 200)
-        fc_data = r_fork_cont.json()
-        self.assertEqual(fc_data["fork_token_idx"], 11)
-        self.assertEqual(fc_data["edited_tokens_count"], 4)
-        self.assertEqual(fc_data["continuation_tokens_count"], 6)
-        cont_tokens = fc_data["continuation_tokens"]
-        self.assertEqual(len(cont_tokens), 6)
-        expected_cont_indices = [15, 16, 17, 18, 19, 20]
-        self.assertEqual([ct["token_idx"] for ct in cont_tokens], expected_cont_indices)
-        for ct in cont_tokens:
-            self.assertIn("lookback_score", ct)
-            self.assertIn("mean_lookback_score", ct)
-            self.assertIn("head_scores", ct)
-            self.assertIn("is_think_end", ct)
-
-        # Chained (multi-hop) fork directly at `token_idx=18` INSIDE the decoded continuation stream!
-        chained_fork_idx = cont_tokens[3]["token_idx"]  # 18
-        self.assertEqual(chained_fork_idx, 18)
-        r_chained = client.post(
-            "/api/fork_and_edit",
-            json={
-                "fork_token_idx": chained_fork_idx,
-                "edited_token_ids": [90, 91, 92],
-                "alpha": 0.5,
-                "think_gated": True,
-                "max_new_tokens": 4,
-                "capture_probe": True,
-            },
-        )
-        self.assertEqual(r_chained.status_code, 200)
-        ch_data = r_chained.json()
-        self.assertEqual(ch_data["fork_token_idx"], 18)
-        self.assertEqual(ch_data["edited_tokens_count"], 3)
-        self.assertEqual(
-            [et["token_idx"] for et in ch_data["edited_tokens"]],
-            [18, 19, 20],
-        )
-        self.assertEqual(
-            [ct["token_idx"] for ct in ch_data["continuation_tokens"]],
-            [21, 22, 23, 24],
-        )
-
-        # Also verify POST /api/promote_to_baseline promotes the chained stream (25 tokens) to Left Panel baseline
-        r_promote = client.post("/api/promote_to_baseline")
-        self.assertEqual(r_promote.status_code, 200)
-        prom_data = r_promote.json()
-        self.assertTrue(prom_data["promoted"])
-        self.assertEqual(prom_data["total_tokens"], 25)
-        self.assertEqual(len(prom_data["tokens"]), 25)
-
-        # 7. Verify POST /v1/chat/completions with `think_gated=True` auto-release on `</think>`
-        # Inject `</think>` token ID (152) into `engine.think_close_token_ids` and also test
-        # when the first generated token triggers `</think>` release
-        orig_check = engine._check_think_closed
-        engine._check_think_closed = lambda gen_ids, txt: len(gen_ids) >= 2
-        try:
-            r_chat = client.post(
-                "/v1/chat/completions",
+            # 3. Verify POST /api/prefill_and_probe with stride-8 dense snapshotting + rhythm telemetry
+            prompt_ids = [1, 2, 3, 4, 150, 151]  # think_start_idx = 6
+            think_ids = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]  # 18 tokens -> total 24
+            r_probe = client.post(
+                "/api/prefill_and_probe",
                 json={
-                    "model": "Qwen3.8-27B-synthetic-test",
-                    "messages": [{"role": "user", "content": "Derive Gated DeltaNet state."}],
-                    "max_tokens": 5,
-                    "alpha": 1.0,
-                    "think_gated": True,
+                    "prompt_token_ids": prompt_ids,
+                    "think_token_ids": think_ids,
+                    "alpha": 0.0,
+                    "snapshot_stride": 8,
                 },
             )
-            self.assertEqual(r_chat.status_code, 200)
-            chat_data = r_chat.json()
-            self.assertEqual(chat_data["object"], "chat.completion")
-            telem = chat_data["sandbox_telemetry"]
-            self.assertTrue(telem["think_gated"])
-            self.assertEqual(telem["think_gated_released_at_step"], 2)
-            # Steps 0 and 1 run at alpha=1.0; steps 2, 3, 4 run at alpha=0.0 after </think> release!
-            self.assertEqual(telem["alpha_schedule"], [1.0, 1.0, 0.0, 0.0, 0.0])
-        finally:
-            engine._check_think_closed = orig_check
+            self.assertEqual(r_probe.status_code, 200)
+            probe_data = r_probe.json()
+            self.assertEqual(probe_data["think_start_idx"], 6)
+            self.assertEqual(probe_data["total_tokens"], 24)
+            self.assertEqual(probe_data["snapshots"], [6, 14, 22, 24])
+            self.assertEqual(len(probe_data["tokens"]), 24)
+            self.assertIn("peak_spike_token", probe_data)
+            self.assertIn("peak_lookback_token_idx", probe_data)
+            self.assertIn("peak_preplan_token_idx", probe_data)
+            self.assertIn("peak_anchor_token_idx", probe_data)
+            self.assertIn("coupled_junctures", probe_data)
+            self.assertEqual(probe_data["rhythm_summary"]["num_total_heads"], 384)
+            self.assertEqual(probe_data["rhythm_summary"]["num_local_heads"], 192)
+            self.assertEqual(probe_data["rhythm_summary"]["num_global_heads"], 192)
+            for tok_obj in probe_data["tokens"]:
+                for req_field in (
+                    "lookback_score",
+                    "preplan_score",
+                    "waad_raw",
+                    "anchor_score",
+                    "fai_raw",
+                    "is_coupled_juncture",
+                ):
+                    self.assertIn(req_field, tok_obj)
+            self.assertTrue(probe_data["peak_spike_token"]["is_think"])
+            self.assertEqual(
+                sorted(probe_data["tail_16_summary"]["per_head"].keys()),
+                ["L35.H21", "L39.H0", "L39.H1", "L43.H1", "L43.H7"],
+            )
+
+            # 4. Verify arbitrary-index stride-8 snapshot + delta replay exactness (< 1e-5)
+            # Fork at arbitrary token index 11 (between snapshot 6 and snapshot 14 -> 5 delta tokens replayed)
+            fork_idx = 11
+            edited_ids = [40, 41, 42, 43, 44, 45]
+            r_fork = client.post(
+                "/api/fork_and_edit",
+                json={
+                    "fork_token_idx": fork_idx,
+                    "edited_token_ids": edited_ids,
+                    "alpha": 0.0,
+                    "think_gated": True,
+                    "max_new_tokens": 0,
+                    "capture_probe": True,
+                },
+            )
+            self.assertEqual(r_fork.status_code, 200)
+            fork_data = r_fork.json()
+            self.assertEqual(fork_data["fork_token_idx"], 11)
+            self.assertEqual(fork_data["snapshot_restored_idx"], 6)
+            self.assertEqual(fork_data["delta_tokens_replayed"], 5)
+            self.assertEqual(fork_data["edited_tokens_count"], 6)
+            self.assertEqual(len(fork_data["edited_tokens"]), 6)
+            self.assertEqual(len(fork_data["forked_tokens"]), 6)
+            self.assertIn("spi_trace_id", fork_data)
+            self.assertEqual(fork_data["spi_traces_count"], 1)
+
+            # Compare engine's hybrid cache state after stride-8 snapshot (at 6) + 5-token delta replay (to 11) + 6 edited tokens
+            # against a reference timeline with a direct snapshot at fork_idx=11
             projector.detach(self.model)
+            clean_timeline = HybridTimelineCache(model=self.model, prefill_step_size=512)
+            _ = clean_timeline.prefill_with_snapshots(prompt_ids, snapshot_indices=[6])
+            _ = clean_timeline.prefill_with_snapshots(think_ids[:5], snapshot_indices=[fork_idx])
+            with capture_attention_maps(self.model):
+                _ = clean_timeline.fork_and_edit(edit_token_idx=fork_idx, new_token_ids=edited_ids)
+
+            for l_idx in engine.timeline.deltanet_layer_indices:
+                s_fork = engine.timeline.cache[l_idx][1]
+                s_clean = clean_timeline.cache[l_idx][1]
+                diff = float(mx.max(mx.abs(s_fork - s_clean)).item())
+                self.assertLess(
+                    diff,
+                    1e-5,
+                    f"Stride-8 snapshot + delta replay DeltaNet state diverged at layer {l_idx}: {diff}",
+                )
+
+            for l_idx in engine.timeline.kv_layer_indices:
+                k_fork, v_fork = engine.timeline.cache[l_idx].keys_and_values()
+                k_clean, v_clean = clean_timeline.cache[l_idx].keys_and_values()
+                k_diff = float(
+                    mx.max(mx.abs(k_fork.astype(mx.float32) - k_clean.astype(mx.float32))).item()
+                )
+                self.assertLess(k_diff, 1e-5)
+
+            # Re-attach projector for organic prefill, chained continuation fork, SPI logger, and chat completion tests
+            projector.attach(self.model)
+
+            # 5. Verify POST /api/prefill_and_probe in Organic Generation Mode (`clause_a_text=""`, `generate_organic_tokens=12`)
+            r_organic = client.post(
+                "/api/prefill_and_probe",
+                json={
+                    "prompt_token_ids": prompt_ids,
+                    "clause_a_text": "",
+                    "generate_organic_tokens": 12,
+                    "organic_alpha": 0.0,
+                    "snapshot_stride": 8,
+                },
+            )
+            self.assertEqual(r_organic.status_code, 200)
+            org_data = r_organic.json()
+            self.assertTrue(org_data["organic_generated"])
+            self.assertEqual(org_data["think_start_idx"], 6)
+            self.assertEqual(org_data["think_tokens"], 12)
+            self.assertEqual(org_data["total_tokens"], 18)
+            # Stride-8 snapshots from think_start_idx=6 over 12 generated tokens -> [6, 14, 18]
+            self.assertEqual(org_data["snapshots"], [6, 14, 18])
+            self.assertEqual(len(org_data["tokens"]), 18)
+            for idx_i, tok_rec in enumerate(org_data["tokens"]):
+                self.assertEqual(tok_rec["token_idx"], idx_i)
+                self.assertIn("mean_lookback_score", tok_rec)
+                self.assertIn("preplan_score", tok_rec)
+                self.assertIn("anchor_score", tok_rec)
+
+            # 6. Verify POST /api/fork_and_edit returns clickable `continuation_tokens` with valid sequential `token_idx`
+            #    and rhythm scores, AND supports a second chained `POST /api/fork_and_edit` inside `continuation_tokens`!
+            r_fork_cont = client.post(
+                "/api/fork_and_edit",
+                json={
+                    "fork_token_idx": 11,
+                    "edited_token_ids": [40, 41, 42, 43],
+                    "alpha": 1.0,
+                    "think_gated": True,
+                    "max_new_tokens": 6,
+                    "capture_probe": True,
+                },
+            )
+            self.assertEqual(r_fork_cont.status_code, 200)
+            fc_data = r_fork_cont.json()
+            self.assertEqual(fc_data["fork_token_idx"], 11)
+            self.assertEqual(fc_data["edited_tokens_count"], 4)
+            self.assertEqual(fc_data["continuation_tokens_count"], 6)
+            self.assertIn("peak_lookback_token_idx", fc_data)
+            self.assertIn("peak_preplan_token_idx", fc_data)
+            self.assertIn("peak_anchor_token_idx", fc_data)
+            self.assertIn("coupled_junctures", fc_data)
+            cont_tokens = fc_data["continuation_tokens"]
+            self.assertEqual(len(cont_tokens), 6)
+            expected_cont_indices = [15, 16, 17, 18, 19, 20]
+            self.assertEqual([ct["token_idx"] for ct in cont_tokens], expected_cont_indices)
+            for ct in cont_tokens:
+                for req_field in (
+                    "lookback_score",
+                    "mean_lookback_score",
+                    "preplan_score",
+                    "waad_raw",
+                    "anchor_score",
+                    "fai_raw",
+                    "is_coupled_juncture",
+                    "head_scores",
+                    "is_think_end",
+                ):
+                    self.assertIn(req_field, ct)
+
+            # Chained (multi-hop) fork directly at `token_idx=18` INSIDE the decoded continuation stream!
+            chained_fork_idx = cont_tokens[3]["token_idx"]  # 18
+            self.assertEqual(chained_fork_idx, 18)
+            r_chained = client.post(
+                "/api/fork_and_edit",
+                json={
+                    "fork_token_idx": chained_fork_idx,
+                    "edited_token_ids": [90, 91, 92],
+                    "alpha": 0.5,
+                    "think_gated": True,
+                    "max_new_tokens": 4,
+                    "capture_probe": True,
+                },
+            )
+            self.assertEqual(r_chained.status_code, 200)
+            ch_data = r_chained.json()
+            self.assertEqual(ch_data["fork_token_idx"], 18)
+            self.assertEqual(ch_data["edited_tokens_count"], 3)
+            self.assertEqual(
+                [et["token_idx"] for et in ch_data["edited_tokens"]],
+                [18, 19, 20],
+            )
+            self.assertEqual(
+                [ct["token_idx"] for ct in ch_data["continuation_tokens"]],
+                [21, 22, 23, 24],
+            )
+
+            # 7. Verify Automatic Counterfactual Trajectory Logger (`spi_traces.jsonl`) & `/api/spi_traces` + `/api/spi_traces/label`
+            self.assertTrue(spi_log_file.exists())
+            r_spi_list = client.get("/api/spi_traces")
+            self.assertEqual(r_spi_list.status_code, 200)
+            spi_list_data = r_spi_list.json()
+            # 3 fork_and_edit calls were executed above -> 3 counterfactual traces logged
+            self.assertEqual(spi_list_data["count"], 3)
+            latest_trace = spi_list_data["traces"][0]
+            self.assertEqual(latest_trace["trace_id"], ch_data["spi_trace_id"])
+            self.assertEqual(latest_trace["fork_token_idx"], 18)
+            self.assertEqual(latest_trace["label"], "candidate")
+            for k in (
+                "attention_jsd_shift",
+                "lookback_mass_delta",
+                "preplan_mean_delta",
+                "anchor_mean_delta",
+                "fork_edit_ms",
+            ):
+                self.assertIn(k, latest_trace["causal_deltas"])
+            self.assertIn("telemetry_at_fork", latest_trace["rejected_branch"])
+            self.assertIn("telemetry_summary", latest_trace["repaired_branch"])
+
+            # Mark latest trace as Gold SPI Pair ("accepted") via POST /api/spi_traces/label
+            r_spi_label = client.post(
+                "/api/spi_traces/label",
+                json={"trace_id": ch_data["spi_trace_id"], "label": "accepted"},
+            )
+            self.assertEqual(r_spi_label.status_code, 200)
+            lbl_data = r_spi_label.json()
+            self.assertTrue(lbl_data["updated"])
+            self.assertEqual(lbl_data["label"], "accepted")
+            r_spi_after = client.get("/api/spi_traces").json()
+            self.assertEqual(r_spi_after["traces"][0]["label"], "accepted")
+
+            # Also verify POST /api/promote_to_baseline promotes the chained stream (25 tokens) to Left Panel baseline
+            r_promote = client.post("/api/promote_to_baseline")
+            self.assertEqual(r_promote.status_code, 200)
+            prom_data = r_promote.json()
+            self.assertTrue(prom_data["promoted"])
+            self.assertEqual(prom_data["total_tokens"], 25)
+            self.assertEqual(len(prom_data["tokens"]), 25)
+
+            # 8. Verify POST /v1/chat/completions with `think_gated=True` auto-release on `</think>`
+            orig_check = engine._check_think_closed
+            engine._check_think_closed = lambda gen_ids, txt: len(gen_ids) >= 2
+            try:
+                r_chat = client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "Qwen3.8-27B-synthetic-test",
+                        "messages": [{"role": "user", "content": "Derive Gated DeltaNet state."}],
+                        "max_tokens": 5,
+                        "alpha": 1.0,
+                        "think_gated": True,
+                    },
+                )
+                self.assertEqual(r_chat.status_code, 200)
+                chat_data = r_chat.json()
+                self.assertEqual(chat_data["object"], "chat.completion")
+                telem = chat_data["sandbox_telemetry"]
+                self.assertTrue(telem["think_gated"])
+                self.assertEqual(telem["think_gated_released_at_step"], 2)
+                # Steps 0 and 1 run at alpha=1.0; steps 2, 3, 4 run at alpha=0.0 after </think> release!
+                self.assertEqual(telem["alpha_schedule"], [1.0, 1.0, 0.0, 0.0, 0.0])
+            finally:
+                engine._check_think_closed = orig_check
+                projector.detach(self.model)
+
+    def test_06_preplan_and_anchor_rhythm_telemetry(self):
+        """
+        Verify `compute_preplan_and_anchor_rhythm` in `attention_probe.py`:
+          1. Sink-free `<think>` submatrix normalization over `j <= i`.
+          2. Automatic Local vs. Global head partitioning (192 local vs 192 global heads across 384 heads).
+          3. Preplan (`WAAD_t` + `Delta WAAD_t`) peak detection, Anchor (`FAI_s`) hub detection,
+             and Coupled `Preplan -> Anchor` juncture identification (`1..6` tokens apart).
+        """
+        from attention_probe import (
+            FULL_ATTENTION_LAYERS_DEFAULT,
+            compute_preplan_and_anchor_rhythm,
+        )
+
+        think_start_idx = 6
+        m_len = 24
+        total_len = think_start_idx + m_len
+        n_heads_per_layer = 24
+
+        # Construct synthetic 16-layer x 24-head attention maps with:
+        #   - First 8 layers (192 heads) acting as Locally Focused Heads (attending mostly to i or i-1,
+        #     except at relative token p_rel=8 where they reach back to j=0 -> sharp WAAD_t preplan spike!)
+        #   - Last 8 layers (192 heads) acting as Globally Focused Heads (attending mostly to long-range
+        #     tokens, with future tokens i in [12..22] strongly attending to anchor token a_rel=10!)
+        synth_attn: Dict[int, mx.array] = {}
+        for idx_l, l_idx in enumerate(FULL_ATTENTION_LAYERS_DEFAULT):
+            mat_np = np.zeros((1, n_heads_per_layer, m_len, total_len), dtype=np.float32)
+            is_local_layer = idx_l < 8
+            for i in range(m_len):
+                abs_i = think_start_idx + i
+                if is_local_layer:
+                    # Local head: normally attends to self (distance 0), but at i == 8 reaches back to j == 0 (distance 8)
+                    if i == 8:
+                        mat_np[:, :, i, think_start_idx + 0] = 0.95
+                        mat_np[:, :, i, abs_i] = 0.05
+                    else:
+                        mat_np[:, :, i, abs_i] = 0.90
+                        if i > 0:
+                            mat_np[:, :, i, abs_i - 1] = 0.10
+                else:
+                    # Global head: future tokens i >= 12 strongly attend to anchor a_rel = 10
+                    if i >= 12:
+                        mat_np[:, :, i, think_start_idx + 10] = 0.80
+                        mat_np[:, :, i, think_start_idx + 0] = 0.20
+                    else:
+                        mat_np[:, :, i, think_start_idx + 0] = 0.85
+                        mat_np[:, :, i, abs_i] = 0.15
+            synth_attn[l_idx] = mx.array(mat_np)
+
+        rhythm = compute_preplan_and_anchor_rhythm(
+            attn_maps=synth_attn,
+            think_start_idx=think_start_idx,
+            query_offset=think_start_idx,
+        )
+
+        self.assertEqual(rhythm["num_total_heads"], 384)
+        self.assertEqual(rhythm["num_local_heads"], 192)
+        self.assertEqual(rhythm["num_global_heads"], 192)
+        self.assertEqual(len(rhythm["preplan_scores"]), m_len)
+        self.assertEqual(len(rhythm["anchor_scores"]), m_len)
+
+        # Verify all normalized scores are in [0, 1]
+        for s in rhythm["preplan_scores"]:
+            self.assertGreaterEqual(s, 0.0)
+            self.assertLessEqual(s, 1.0)
+        for s in rhythm["anchor_scores"]:
+            self.assertGreaterEqual(s, 0.0)
+            self.assertLessEqual(s, 1.0)
+
+        # Peak preplan token must be at think_start_idx + 8 = 14
+        self.assertEqual(rhythm["peak_preplan_token_idx"], think_start_idx + 8)
+        # Peak anchor token must be at think_start_idx + 10 = 16
+        self.assertEqual(rhythm["peak_anchor_token_idx"], think_start_idx + 10)
+
+        # Verify coupled Preplan (14) -> Anchor (16) juncture (distance = 2 tokens in [1..6]) is detected!
+        juncture_pairs = [
+            (j["preplan_idx"], j["anchor_idx"]) for j in rhythm["coupled_junctures"]
+        ]
+        self.assertIn((14, 16), juncture_pairs)
+        self.assertIn(14, rhythm["coupled_token_indices"])
+        self.assertIn(16, rhythm["coupled_token_indices"])
 
 
 if __name__ == "__main__":

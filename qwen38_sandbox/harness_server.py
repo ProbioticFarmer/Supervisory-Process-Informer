@@ -10,24 +10,29 @@ Keeps a singleton `SandboxEngine` hot in unified memory (`HybridTimelineCache` +
      `<think>` Generation Mode** (`clause_a_text=""`, `generate_organic_tokens=48`, `organic_alpha`),
      automatically snapshotting the 48 Gated DeltaNet `ArraysCache` states at `think_start_idx`
      and every `snapshot_stride=8` tokens inside `<think>`, and capturing unfused attention maps
-     across all 16 full-attention layers to return per-token 5-Head Prompt-Lookback Scores
-     (`L35.H21`, `L39.H1`, `L43.H7`, `L43.H1`, `L39.H0`) plus the peak spike token `q_spike`.
+     across all 16 full-attention layers (`384` heads) to return:
+       - Per-token 5-Head Prompt-Lookback Scores (`L35.H21`, `L39.H1`, `L43.H7`, `L43.H1`, `L39.H0`)
+       - Task-Agnostic Preplan Rhythm (`preplan_score` / `waad_raw`) & Anchor Influence (`anchor_score` / `fai_raw`)
+       - Coupled `Preplan -> Anchor` junctures (`coupled_junctures`, `is_coupled_juncture`)
   3. `POST /api/fork_and_edit`: Rewinds to any arbitrary `fork_token_idx` inside `<think>` (or
-     inside a previously forked continuation stream!) in `< 50 ms` by restoring the nearest
-     stride-8 snapshot `<= fork_token_idx` and replaying the `0..7` token delta, warm-prefills
-     `edited_text` under `alpha` / `think_gated`, decodes `max_new_tokens` continuation tokens
-     with stride-8 snapshots and unfused 5-head lookback probing, and returns clickable
-     per-token records for both `edited_tokens` and `continuation_tokens`.
+     inside a previously forked continuation stream!) in `< 50 ms`, warm-prefills `edited_text`
+     under `alpha` / `think_gated`, decodes `max_new_tokens` continuation tokens with stride-8
+     snapshots and unfused 384-head rhythm + 5-head lookback probing, and automatically logs a
+     counterfactual trajectory record to `outputs/spi_traces.jsonl`.
   4. `POST /api/promote_to_baseline`: Promotes the active forked + continuation stream to the
      baseline state for infinite multi-hop reasoning tree surgery.
-  5. `GET  /`: Self-contained dark-mode Single-Page Workbench UI with Organic `<think>` Generation,
-     clickable heat-colored `edited_tokens` and `continuation_tokens` chips, `</think>` gate
-     release badges, and one-click promotion to baseline.
+  5. `GET  /api/spi_traces` & `POST /api/spi_traces/label`: Inspects and labels logged SPI
+     counterfactual trajectories (`"accepted"`, `"candidate"`, `"rejected"`).
+  6. `GET  /`: Self-contained dark-mode Single-Page Workbench UI with live 4-mode Telemetry
+     Heatmap switcher (`Prompt Lookback`, `Preplan Rhythm (WAAD)`, `Anchor Influence (FAI)`,
+     `Coupled Preplan->Anchor Junctures`), Organic `<think>` Generation, recursive continuation
+     forking, and one-click **"★ Mark as Gold SPI Pair"** labeling.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import threading
 import time
@@ -44,6 +49,7 @@ from pydantic import BaseModel, ConfigDict
 from attention_probe import (
     capture_attention_maps,
     compute_attention_shift,
+    compute_preplan_and_anchor_rhythm,
 )
 from benchmark_and_experiment import (
     DEFAULT_8BIT_LOCAL_PATH,
@@ -67,6 +73,7 @@ from subspace_projector import (
 
 DEFAULT_VECTOR_PATH = "./vectors/Qwen3.8-27B-abliterated-cyber-GLP-49-L10-58-a1.gguf"
 DEFAULT_SNAPSHOT_STRIDE = 8
+DEFAULT_SPI_LOG_PATH = Path(__file__).resolve().parent / "outputs" / "spi_traces.jsonl"
 
 
 def _parse_active_layers(
@@ -170,10 +177,122 @@ def _decode_single_token(tokenizer: Any, token_id: int) -> str:
     return f"<{token_id}>"
 
 
+class SPITrajectoryLogger:
+    """
+    Automatic Counterfactual Trajectory Logger (`spi_traces.jsonl`).
+    Appends a structured JSON Lines record on every `/api/fork_and_edit` intervention
+    and supports listing and re-labeling traces (`"accepted"`, `"candidate"`, `"rejected"`).
+    """
+
+    def __init__(self, log_path: Union[str, Path] = DEFAULT_SPI_LOG_PATH):
+        self.log_path = Path(log_path)
+        self._lock = threading.Lock()
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append_trace(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+
+    def read_all(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            if not self.log_path.exists():
+                return []
+            traces: List[Dict[str, Any]] = []
+            with self.log_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        traces.append(json.loads(s))
+                    except Exception:
+                        continue
+            return traces
+
+    def count(self) -> int:
+        return len(self.read_all())
+
+    def list_recent(self, limit: int = 25) -> Dict[str, Any]:
+        all_traces = self.read_all()
+        recent = all_traces[-max(1, int(limit)) :]
+        summaries = [
+            {
+                "trace_id": t.get("trace_id"),
+                "timestamp": t.get("timestamp"),
+                "model_path": t.get("model_path"),
+                "think_start_idx": t.get("think_start_idx"),
+                "fork_token_idx": t.get("fork_token_idx"),
+                "label": t.get("label", "candidate"),
+                "causal_deltas": t.get("causal_deltas", {}),
+                "rejected_branch": t.get("rejected_branch", {}),
+                "repaired_branch": t.get("repaired_branch", {}),
+            }
+            for t in reversed(recent)
+        ]
+        return {
+            "count": len(all_traces),
+            "log_path": str(self.log_path),
+            "traces": summaries,
+        }
+
+    def update_label(
+        self,
+        label: str = "accepted",
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if label not in ("accepted", "candidate", "rejected"):
+            raise ValueError(
+                f"Invalid label {label!r}; must be 'accepted', 'candidate', or 'rejected'."
+            )
+        with self._lock:
+            if not self.log_path.exists():
+                raise ValueError("No SPI traces logged yet.")
+            traces: List[Dict[str, Any]] = []
+            with self.log_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        traces.append(json.loads(s))
+            if not traces:
+                raise ValueError("No SPI traces logged yet.")
+
+            target_idx: Optional[int] = None
+            if trace_id is None or not str(trace_id).strip():
+                target_idx = len(traces) - 1
+            else:
+                for i in range(len(traces) - 1, -1, -1):
+                    if traces[i].get("trace_id") == trace_id:
+                        target_idx = i
+                        break
+            if target_idx is None:
+                raise ValueError(f"trace_id={trace_id!r} not found in {self.log_path}.")
+
+            traces[target_idx]["label"] = label
+            traces[target_idx]["labeled_at"] = datetime.now(timezone.utc).isoformat()
+            updated_trace_id = traces[target_idx].get("trace_id")
+
+            tmp_path = self.log_path.with_suffix(".jsonl.tmp")
+            with tmp_path.open("w", encoding="utf-8") as f:
+                for t in traces:
+                    f.write(json.dumps(t, ensure_ascii=False) + "\n")
+            tmp_path.replace(self.log_path)
+
+            return {
+                "updated": True,
+                "trace_id": updated_trace_id,
+                "label": label,
+                "count": len(traces),
+                "log_path": str(self.log_path),
+            }
+
+
 class SandboxEngine:
     """
-    Stateful singleton holding the Qwen3.8-27B model, `SubspaceProjector`, and
-    `HybridTimelineCache` hot in Apple Silicon Unified Memory.
+    Stateful singleton holding the Qwen3.8-27B model, `SubspaceProjector`,
+    `HybridTimelineCache`, and `SPITrajectoryLogger` hot in Apple Silicon Unified Memory.
     """
 
     def __init__(
@@ -185,6 +304,7 @@ class SandboxEngine:
         prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
         snapshot_stride: int = DEFAULT_SNAPSHOT_STRIDE,
         monitor_heads: Sequence[Tuple[int, int]] = LOOKBACK_HEADS_5,
+        spi_log_path: Optional[Union[str, Path]] = None,
     ):
         enforce_metal_command_buffer_invariant()
         self.lock = threading.Lock()
@@ -195,6 +315,9 @@ class SandboxEngine:
         self.prefill_step_size = prefill_step_size
         self.snapshot_stride = max(1, int(snapshot_stride))
         self.monitor_heads: Tuple[Tuple[int, int], ...] = tuple(monitor_heads)
+        self.spi_logger = SPITrajectoryLogger(
+            log_path=spi_log_path if spi_log_path is not None else DEFAULT_SPI_LOG_PATH
+        )
 
         if hasattr(self.model, "eval"):
             self.model.eval()
@@ -212,6 +335,7 @@ class SandboxEngine:
         self.active_token_records: List[Dict[str, Any]] = []
         self.baseline_think_attn: Dict[int, mx.array] = {}
         self.active_think_attn: Dict[int, mx.array] = {}
+        self.last_rhythm_info: Dict[str, Any] = {}
 
         # Identify `</think>` token IDs if present in tokenizer
         self.think_close_token_ids: List[int] = []
@@ -229,15 +353,30 @@ class SandboxEngine:
         attn_maps: Dict[int, mx.array],
         query_offset: int,
         think_end_token_idx: Optional[int] = None,
+        rhythm_info: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Compute per-token 5-Head Prompt-Lookback Scores (`L35.H21`, `L39.H1`, `L43.H7`,
-        `L43.H1`, `L39.H0`) for query tokens starting at `query_offset`.
-
-        For each query token `q_abs = query_offset + q_rel`, computes the attention probability
-        mass placed on the User Prompt tokens `[0 .. think_start_idx - 1]` vs. Local `<think>`
-        tokens `[think_start_idx .. q_abs]`.
+        Compute per-token telemetry across `all_token_ids`:
+          1. 5-Head Prompt-Lookback Scores (`L35.H21`, `L39.H1`, `L43.H7`, `L43.H1`, `L39.H0`)
+          2. Task-Agnostic Preplan Rhythm (`preplan_score` / `waad_raw`)
+          3. Task-Agnostic Anchor Influence (`anchor_score` / `fai_raw`)
+          4. Coupled Preplan -> Anchor Juncture flags (`is_coupled_juncture`, `juncture_role`)
         """
+        if rhythm_info is None:
+            rhythm_info = compute_preplan_and_anchor_rhythm(
+                attn_maps=attn_maps,
+                think_start_idx=think_start_idx,
+                query_offset=query_offset,
+            )
+
+        rhythm_span_start = int(rhythm_info.get("span_start_idx", max(think_start_idx, query_offset)))
+        waad_raw_list: List[float] = rhythm_info.get("waad_raw", [])
+        preplan_list: List[float] = rhythm_info.get("preplan_scores", [])
+        fai_raw_list: List[float] = rhythm_info.get("fai_raw", [])
+        anchor_list: List[float] = rhythm_info.get("anchor_scores", [])
+        coupled_indices = set(rhythm_info.get("coupled_token_indices", []))
+        juncture_roles: Dict[int, str] = rhythm_info.get("juncture_roles", {})
+
         head_keys = [f"L{l}.H{h}" for l, h in self.monitor_heads]
         per_head_prompt_series: Dict[str, List[float]] = {}
         q_len = 0
@@ -273,6 +412,22 @@ class SandboxEngine:
                 mean_score = 0.0
                 local_mass = 0.0
 
+            r_rel = idx - rhythm_span_start
+            if is_think and 0 <= r_rel < len(preplan_list):
+                preplan_score = float(preplan_list[r_rel])
+                waad_raw = float(waad_raw_list[r_rel])
+                anchor_score = float(anchor_list[r_rel])
+                fai_raw = float(fai_raw_list[r_rel])
+                is_coupled = idx in coupled_indices
+                j_role = juncture_roles.get(idx, None)
+            else:
+                preplan_score = 0.0
+                waad_raw = 0.0
+                anchor_score = 0.0
+                fai_raw = 0.0
+                is_coupled = False
+                j_role = None
+
             is_think_end = (
                 (think_end_token_idx is not None and idx == think_end_token_idx)
                 or ("</think>" in tok_text)
@@ -289,6 +444,12 @@ class SandboxEngine:
                     "lookback_score": rounded_score,
                     "mean_lookback_score": rounded_score,
                     "local_think_mass": round(local_mass, 6),
+                    "preplan_score": round(preplan_score, 4),
+                    "waad_raw": round(waad_raw, 4),
+                    "anchor_score": round(anchor_score, 4),
+                    "fai_raw": round(fai_raw, 6),
+                    "is_coupled_juncture": bool(is_coupled),
+                    "juncture_role": j_role,
                 }
             )
         return records
@@ -313,7 +474,7 @@ class SandboxEngine:
     ) -> Tuple[mx.array, Dict[int, mx.array]]:
         """
         Prefill `seg_token_ids` starting from `self.timeline.current_offset`, pausing at
-        every stride-8 boundary `(abs_pos - self.think_start_idx) % stride == 0` (and at the
+        every stride-8 boundary `(abs_pos - start_offset) % stride == 0` (and at the
         segment end) to take a materialized Gated DeltaNet `ArraysCache` snapshot while
         stitching the unfused attention maps across the sub-chunks.
         """
@@ -400,7 +561,8 @@ class SandboxEngine:
         natural `<think>` trace (`generate_organic_tokens`, default 48 when `clause_a_text` is empty),
         automatically snapshotting the 48 Gated DeltaNet `ArraysCache` states at `think_start_idx`
         and every `snapshot_stride=8` tokens inside `<think>`, and capturing unfused attention
-        maps across all 16 full-attention layers.
+        maps across all 16 full-attention layers (`384` heads) for both 5-Head Prompt-Lookback
+        and Preplan (`WAAD_t`) + Anchor (`FAI_s`) rhythm telemetry.
         """
         with self.lock:
             stride = max(1, int(snapshot_stride or self.snapshot_stride))
@@ -518,11 +680,19 @@ class SandboxEngine:
             self.baseline_think_attn = stitched_attn
             self.active_think_attn = dict(stitched_attn)
 
+            rhythm_info = compute_preplan_and_anchor_rhythm(
+                attn_maps=stitched_attn,
+                think_start_idx=think_start_idx,
+                query_offset=think_start_idx,
+            )
+            self.last_rhythm_info = rhythm_info
+
             records = self._compute_per_token_lookback_records(
                 all_token_ids=all_ids,
                 think_start_idx=think_start_idx,
                 attn_maps=stitched_attn,
                 query_offset=think_start_idx,
+                rhythm_info=rhythm_info,
             )
             self.baseline_token_records = list(records)
             self.active_token_records = list(records)
@@ -553,7 +723,21 @@ class SandboxEngine:
                 "alpha": eff_alpha,
                 "active_layers": [layers_list[0], layers_list[-1]] if layers_list else [],
                 "peak_spike_token": peak_tok,
+                "peak_lookback_token_idx": int(peak_tok["token_idx"]),
+                "peak_preplan_token_idx": int(rhythm_info["peak_preplan_token_idx"]),
+                "peak_anchor_token_idx": int(rhythm_info["peak_anchor_token_idx"]),
+                "coupled_junctures": rhythm_info["coupled_junctures"],
+                "rhythm_summary": {
+                    "num_total_heads": rhythm_info["num_total_heads"],
+                    "num_local_heads": rhythm_info["num_local_heads"],
+                    "num_global_heads": rhythm_info["num_global_heads"],
+                    "median_head_distance": rhythm_info["median_head_distance"],
+                    "peak_preplan_token_idx": rhythm_info["peak_preplan_token_idx"],
+                    "peak_anchor_token_idx": rhythm_info["peak_anchor_token_idx"],
+                    "coupled_junctures": rhythm_info["coupled_junctures"],
+                },
                 "tail_16_summary": tail_summary,
+                "spi_traces_count": self.spi_logger.count(),
                 "tokens": records,
             }
 
@@ -581,9 +765,21 @@ class SandboxEngine:
             if tail_recs
             else 0.0
         )
+        mean_preplan_tail = (
+            sum(r.get("preplan_score", 0.0) for r in tail_recs) / len(tail_recs)
+            if tail_recs
+            else 0.0
+        )
+        mean_anchor_tail = (
+            sum(r.get("anchor_score", 0.0) for r in tail_recs) / len(tail_recs)
+            if tail_recs
+            else 0.0
+        )
         return {
             "mean_prompt_mass": round(mean_prompt_tail, 4),
             "mean_local_think_mass": round(max(0.0, 1.0 - mean_prompt_tail), 4),
+            "mean_preplan_score": round(mean_preplan_tail, 4),
+            "mean_anchor_score": round(mean_anchor_tail, 4),
             "per_head": per_head_summary,
         }
 
@@ -625,20 +821,26 @@ class SandboxEngine:
         think_gated: bool = True,
         max_new_tokens: int = 24,
         capture_probe: bool = True,
+        label: str = "candidate",
     ) -> Dict[str, Any]:
         """
         Rewind the 16 `KVCache` views and restore the nearest `ArraysCache` snapshot
         `<= fork_token_idx` (supporting both baseline token indices AND any token index
         inside a previously forked / decoded continuation stream!), warm-prefill `edited_text`
         under `alpha` / `think_gated`, decode `max_new_tokens` continuation tokens with
-        stride-8 snapshots and unfused 5-head lookback probing, and return clickable
-        token records for both `edited_tokens` and `continuation_tokens`.
+        stride-8 snapshots and unfused 5-head lookback + 384-head rhythm probing, and
+        automatically log a counterfactual record to `spi_traces.jsonl`.
         """
         with self.lock:
             reference_history = (
-                self.active_token_ids
+                list(self.active_token_ids)
                 if len(self.active_token_ids) >= len(self.baseline_token_ids)
-                else self.baseline_token_ids
+                else list(self.baseline_token_ids)
+            )
+            reference_records = (
+                list(self.active_token_records)
+                if len(self.active_token_records) >= len(self.baseline_token_records)
+                else list(self.baseline_token_records)
             )
             if not reference_history:
                 raise ValueError(
@@ -734,8 +936,7 @@ class SandboxEngine:
                 self.projector.configure(alpha=0.0, enabled=False, clear_token_slice=True)
 
                 # Rewind to `cont_start_idx` and run a single fast batched prefill over `continuation_ids`
-                # with stride-8 snapshots and `capture_attention_maps` so every decoded continuation token
-                # gets its exact 5-head Prompt-Lookback Score AND is rewindable for iterative re-forking!
+                # with stride-8 snapshots and `capture_attention_maps`
                 self.timeline.rewind_to(cont_start_idx)
                 self.timeline.restore(cont_start_idx)
                 self.timeline.token_history = list(prefix_and_edit_ids)
@@ -763,7 +964,7 @@ class SandboxEngine:
             self.timeline.token_history = list(full_forked_ids)
             self.active_token_ids = list(full_forked_ids)
 
-            # Stitch `fork_edit_attn` and `cont_attn` into a unified attention map over `new_ids + continuation_ids`
+            # Stitch `fork_edit_attn` and `cont_attn` (and any prior <think> prefix rows)
             if capture_probe:
                 if fork_edit_attn and cont_attn:
                     combined_fork_attn = self._stitch_attention_sequence([fork_edit_attn, cont_attn])
@@ -771,8 +972,52 @@ class SandboxEngine:
                     combined_fork_attn = fork_edit_attn
                 else:
                     combined_fork_attn = cont_attn
+
+                prefix_think_q = max(0, fork_idx - self.think_start_idx)
+                prior_attn_source = self.active_think_attn or self.baseline_think_attn
+                if prefix_think_q > 0 and prior_attn_source and combined_fork_attn:
+                    sample_l = next(iter(prior_attn_source.keys()))
+                    if int(prior_attn_source[sample_l].shape[2]) >= prefix_think_q:
+                        prefix_think_attn = {
+                            l_idx: mat[:, :, :prefix_think_q, :fork_idx]
+                            for l_idx, mat in prior_attn_source.items()
+                        }
+                        full_think_attn = self._stitch_attention_sequence(
+                            [prefix_think_attn, combined_fork_attn]
+                        )
+                        attn_for_records = full_think_attn
+                        query_offset_for_records = self.think_start_idx
+                        self.active_think_attn = full_think_attn
+                    else:
+                        attn_for_records = combined_fork_attn
+                        query_offset_for_records = fork_idx
+                else:
+                    attn_for_records = combined_fork_attn
+                    query_offset_for_records = fork_idx
+                    if fork_idx == self.think_start_idx and combined_fork_attn:
+                        self.active_think_attn = combined_fork_attn
             else:
                 combined_fork_attn = {}
+                attn_for_records = {}
+                query_offset_for_records = fork_idx
+
+            rhythm_info = compute_preplan_and_anchor_rhythm(
+                attn_maps=attn_for_records,
+                think_start_idx=self.think_start_idx,
+                query_offset=query_offset_for_records,
+            )
+            self.last_rhythm_info = rhythm_info
+
+            try:
+                decoded_edited_text = (
+                    edited_text
+                    if edited_text is not None
+                    else str(self.tokenizer.decode(new_ids))
+                )
+            except Exception:
+                decoded_edited_text = "".join(
+                    _decode_single_token(self.tokenizer, tid) for tid in new_ids
+                )
 
             try:
                 continuation_text = str(self.tokenizer.decode(continuation_ids))
@@ -789,23 +1034,27 @@ class SandboxEngine:
                     _decode_single_token(self.tokenizer, tid) for tid in all_think_ids
                 )
 
-            # 4. Compute per-token 5-Head Prompt-Lookback Scores across `edited_tokens` and `continuation_tokens`
+            # 4. Compute per-token 5-Head Prompt-Lookback + Preplan (WAAD_t) + Anchor (FAI_s) records
             all_fork_records = self._compute_per_token_lookback_records(
                 all_token_ids=full_forked_ids,
                 think_start_idx=self.think_start_idx,
-                attn_maps=combined_fork_attn,
-                query_offset=fork_idx,
+                attn_maps=attn_for_records,
+                query_offset=query_offset_for_records,
                 think_end_token_idx=think_end_abs_idx,
+                rhythm_info=rhythm_info,
             )
-            # Preserve prior prefix token records [0..fork_idx-1] from active_token_records
-            if len(self.active_token_records) >= fork_idx:
-                merged_records = list(self.active_token_records[:fork_idx]) + all_fork_records[fork_idx:]
+            if query_offset_for_records > 0 and len(reference_records) >= query_offset_for_records:
+                merged_records = (
+                    list(reference_records[:query_offset_for_records])
+                    + all_fork_records[query_offset_for_records:]
+                )
             else:
                 merged_records = all_fork_records
             self.active_token_records = merged_records
 
-            edited_records = all_fork_records[fork_idx:cont_start_idx]
-            continuation_records = all_fork_records[cont_start_idx:]
+            edited_records = merged_records[fork_idx:cont_start_idx]
+            continuation_records = merged_records[cont_start_idx:]
+            repaired_records = edited_records + continuation_records
 
             tail_summary = self._summarize_tail_records(edited_records, tail_window=16)
             cont_tail_summary = (
@@ -834,7 +1083,109 @@ class SandboxEngine:
                     shift_info = compute_attention_shift(overlap_base, overlap_fork)
                     jsd_vs_baseline = float(shift_info["mean_jsd"])
 
+            think_recs_merged = [r for r in merged_records if r["is_think"]]
+            peak_lookback_idx = (
+                int(max(think_recs_merged, key=lambda r: r["lookback_score"])["token_idx"])
+                if think_recs_merged
+                else fork_idx
+            )
+
+            # 5. Automatically construct and append Counterfactual Trajectory Record (`spi_traces.jsonl`)
+            prompt_ids = reference_history[: self.think_start_idx]
+            shared_prefix_ids = reference_history[:fork_idx]
+            rejected_ids = reference_history[fork_idx:]
+            rejected_recs = reference_records[fork_idx:] if len(reference_records) > fork_idx else []
+
+            try:
+                prompt_text_dec = str(self.tokenizer.decode(prompt_ids))
+            except Exception:
+                prompt_text_dec = "".join(_decode_single_token(self.tokenizer, tid) for tid in prompt_ids)
+            try:
+                shared_prefix_text = str(self.tokenizer.decode(shared_prefix_ids))
+            except Exception:
+                shared_prefix_text = "".join(_decode_single_token(self.tokenizer, tid) for tid in shared_prefix_ids)
+            try:
+                rejected_text = str(self.tokenizer.decode(rejected_ids))
+            except Exception:
+                rejected_text = "".join(_decode_single_token(self.tokenizer, tid) for tid in rejected_ids)
+
+            fork_rec_before = (
+                reference_records[fork_idx]
+                if fork_idx < len(reference_records)
+                else (reference_records[-1] if reference_records else {})
+            )
+            rejected_head_summary = self._summarize_tail_records(rejected_recs, tail_window=16)
+
+            rej_lookback_mean = float(rejected_head_summary.get("mean_prompt_mass", 0.0))
+            rej_preplan_mean = float(rejected_head_summary.get("mean_preplan_score", 0.0))
+            rej_anchor_mean = float(rejected_head_summary.get("mean_anchor_score", 0.0))
+
+            rep_lookback_mean = (
+                sum(r["lookback_score"] for r in repaired_records) / len(repaired_records)
+                if repaired_records
+                else 0.0
+            )
+            rep_preplan_mean = (
+                sum(r["preplan_score"] for r in repaired_records) / len(repaired_records)
+                if repaired_records
+                else 0.0
+            )
+            rep_anchor_mean = (
+                sum(r["anchor_score"] for r in repaired_records) / len(repaired_records)
+                if repaired_records
+                else 0.0
+            )
+
+            spi_record = {
+                "trace_id": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "model_path": self.model_id,
+                "prompt_text": prompt_text_dec,
+                "think_start_idx": self.think_start_idx,
+                "fork_token_idx": fork_idx,
+                "shared_prefix_token_ids": shared_prefix_ids,
+                "shared_prefix_text": shared_prefix_text,
+                "rejected_branch": {
+                    "token_ids": rejected_ids,
+                    "text": rejected_text,
+                    "telemetry_at_fork": {
+                        "lookback": float(fork_rec_before.get("lookback_score", 0.0)),
+                        "preplan": float(fork_rec_before.get("preplan_score", 0.0)),
+                        "anchor": float(fork_rec_before.get("anchor_score", 0.0)),
+                    },
+                    "head_mass_summary": rejected_head_summary,
+                },
+                "repaired_branch": {
+                    "edited_text": decoded_edited_text,
+                    "continuation_text": continuation_text,
+                    "token_ids": new_ids + continuation_ids,
+                    "alpha": float(alpha),
+                    "think_gated": bool(think_gated),
+                    "think_end_token_idx": think_end_abs_idx,
+                    "telemetry_summary": {
+                        "mean_lookback": round(rep_lookback_mean, 4),
+                        "mean_preplan": round(rep_preplan_mean, 4),
+                        "mean_anchor": round(rep_anchor_mean, 4),
+                        "peak_preplan_token_idx": int(rhythm_info["peak_preplan_token_idx"]),
+                        "peak_anchor_token_idx": int(rhythm_info["peak_anchor_token_idx"]),
+                    },
+                    "head_mass_summary": tail_summary,
+                },
+                "causal_deltas": {
+                    "attention_jsd_shift": round(jsd_vs_baseline, 6),
+                    "lookback_mass_delta": round(rep_lookback_mean - rej_lookback_mean, 6),
+                    "preplan_mean_delta": round(rep_preplan_mean - rej_preplan_mean, 6),
+                    "anchor_mean_delta": round(rep_anchor_mean - rej_anchor_mean, 6),
+                    "fork_edit_ms": round(fork_edit_ms, 2),
+                },
+                "label": label if label in ("accepted", "candidate", "rejected") else "candidate",
+            }
+            self.spi_logger.append_trace(spi_record)
+            spi_count = self.spi_logger.count()
+
             return {
+                "spi_trace_id": spi_record["trace_id"],
+                "spi_traces_count": spi_count,
                 "fork_token_idx": fork_idx,
                 "snapshot_restored_idx": snap_used,
                 "delta_tokens_replayed": delta_replayed,
@@ -849,9 +1200,23 @@ class SandboxEngine:
                 "think_released_at_step": think_released_at_step,
                 "think_end_token_idx": think_end_abs_idx,
                 "jsd_vs_baseline": round(jsd_vs_baseline, 6),
+                "peak_lookback_token_idx": peak_lookback_idx,
+                "peak_preplan_token_idx": int(rhythm_info["peak_preplan_token_idx"]),
+                "peak_anchor_token_idx": int(rhythm_info["peak_anchor_token_idx"]),
+                "coupled_junctures": rhythm_info["coupled_junctures"],
+                "rhythm_summary": {
+                    "num_total_heads": rhythm_info["num_total_heads"],
+                    "num_local_heads": rhythm_info["num_local_heads"],
+                    "num_global_heads": rhythm_info["num_global_heads"],
+                    "median_head_distance": rhythm_info["median_head_distance"],
+                    "peak_preplan_token_idx": rhythm_info["peak_preplan_token_idx"],
+                    "peak_anchor_token_idx": rhythm_info["peak_anchor_token_idx"],
+                    "coupled_junctures": rhythm_info["coupled_junctures"],
+                },
                 "tail_16_summary": tail_summary,
                 "continuation_tail_16_summary": cont_tail_summary,
                 "edited_tokens": edited_records,
+                "forked_tokens": edited_records,
                 "continuation_tokens": continuation_records,
                 "continuation_token_ids": continuation_ids,
                 "continuation_text": continuation_text,
@@ -868,11 +1233,23 @@ class SandboxEngine:
                 raise ValueError("No active stream to promote.")
             self.baseline_token_ids = list(self.active_token_ids)
             self.baseline_token_records = list(self.active_token_records)
+            if self.active_think_attn:
+                self.baseline_think_attn = dict(self.active_think_attn)
             think_records = [r for r in self.baseline_token_records if r["is_think"]]
             peak_tok = (
                 max(think_records, key=lambda r: r["mean_lookback_score"])
                 if think_records
                 else self.baseline_token_records[-1]
+            )
+            peak_pre_tok = (
+                max(think_records, key=lambda r: r.get("preplan_score", 0.0))
+                if think_records
+                else peak_tok
+            )
+            peak_anc_tok = (
+                max(think_records, key=lambda r: r.get("anchor_score", 0.0))
+                if think_records
+                else peak_tok
             )
             think_ids = self.baseline_token_ids[self.think_start_idx :]
             try:
@@ -890,7 +1267,12 @@ class SandboxEngine:
                 "snapshots": self.timeline.list_snapshots(),
                 "clause_a_text": clause_a_text,
                 "peak_spike_token": peak_tok,
+                "peak_lookback_token_idx": int(peak_tok["token_idx"]),
+                "peak_preplan_token_idx": int(peak_pre_tok["token_idx"]),
+                "peak_anchor_token_idx": int(peak_anc_tok["token_idx"]),
+                "coupled_junctures": self.last_rhythm_info.get("coupled_junctures", []),
                 "tail_16_summary": self._summarize_tail_records(think_records, tail_window=16),
+                "spi_traces_count": self.spi_logger.count(),
                 "tokens": self.baseline_token_records,
             }
 
@@ -1053,7 +1435,13 @@ class ForkAndEditRequest(BaseModel):
     think_gated: bool = True
     max_new_tokens: int = 64
     capture_probe: bool = True
+    label: str = "candidate"
     stream: bool = False
+
+
+class SPITraceLabelRequest(BaseModel):
+    trace_id: Optional[str] = None
+    label: str = "accepted"
 
 
 # ============================================================================
@@ -1083,7 +1471,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; }
   body {
     margin: 0;
-    padding: 18px 24px;
+    padding: 16px 22px;
     background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Inter", "SF Pro Text", monospace;
@@ -1093,12 +1481,14 @@ WORKBENCH_HTML = """<!DOCTYPE html>
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding-bottom: 12px;
+    padding-bottom: 10px;
     border-bottom: 1px solid var(--border);
-    margin-bottom: 16px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+    gap: 10px;
   }
   h1 {
-    font-size: 1.22rem;
+    font-size: 1.2rem;
     margin: 0;
     letter-spacing: -0.02em;
   }
@@ -1106,12 +1496,48 @@ WORKBENCH_HTML = """<!DOCTYPE html>
     display: inline-block;
     padding: 4px 10px;
     border-radius: 999px;
-    font-size: 0.75rem;
+    font-size: 0.74rem;
     font-weight: 600;
     background: var(--panel-alt);
     border: 1px solid var(--border);
     color: var(--accent);
-    margin-left: 6px;
+    margin-left: 5px;
+  }
+  .badge.gold {
+    color: var(--gold);
+    border-color: rgba(250, 204, 21, 0.5);
+  }
+  .mode-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    padding: 8px 14px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+  .mode-tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .mode-btn {
+    background: #0d1424;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 5px 11px;
+    border-radius: 6px;
+    font-size: 0.76rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .mode-btn.active {
+    background: var(--accent);
+    color: #06101e;
+    border-color: var(--accent);
   }
   .grid {
     display: grid;
@@ -1126,7 +1552,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   }
   .card h2 {
     margin: 0 0 8px 0;
-    font-size: 0.96rem;
+    font-size: 0.95rem;
     color: var(--accent);
     display: flex;
     justify-content: space-between;
@@ -1134,7 +1560,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   }
   label {
     display: block;
-    font-size: 0.77rem;
+    font-size: 0.76rem;
     color: var(--muted);
     margin-bottom: 4px;
     margin-top: 8px;
@@ -1147,11 +1573,11 @@ WORKBENCH_HTML = """<!DOCTYPE html>
     border-radius: 6px;
     padding: 7px 9px;
     font-family: inherit;
-    font-size: 0.83rem;
+    font-size: 0.82rem;
   }
   .row {
     display: flex;
-    gap: 10px;
+    gap: 9px;
     align-items: center;
     margin-top: 9px;
     flex-wrap: wrap;
@@ -1161,9 +1587,9 @@ WORKBENCH_HTML = """<!DOCTYPE html>
     color: #07101f;
     border: none;
     border-radius: 6px;
-    padding: 7px 13px;
+    padding: 7px 12px;
     font-weight: 700;
-    font-size: 0.81rem;
+    font-size: 0.8rem;
     cursor: pointer;
     transition: opacity 0.15s;
   }
@@ -1179,6 +1605,10 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   button.promote {
     background: var(--green);
     color: #051b11;
+  }
+  button.gold-btn {
+    background: var(--gold);
+    color: #1c1502;
   }
   button.ghost {
     background: var(--panel-alt);
@@ -1201,7 +1631,7 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   .token-chip {
     padding: 3px 7px;
     border-radius: 5px;
-    font-size: 0.79rem;
+    font-size: 0.78rem;
     cursor: pointer;
     border: 1px solid rgba(255,255,255,0.12);
     user-select: none;
@@ -1218,16 +1648,31 @@ WORKBENCH_HTML = """<!DOCTYPE html>
   .token-chip.spike {
     border: 1.5px solid var(--gold);
   }
+  .token-chip.coupled {
+    border: 1.5px dashed #f472b6;
+    box-shadow: 0 0 6px rgba(244, 114, 182, 0.45);
+  }
   .gate-badge {
     display: inline-flex;
     align-items: center;
     padding: 2px 7px;
     border-radius: 4px;
-    font-size: 0.72rem;
+    font-size: 0.71rem;
     font-weight: 700;
     background: rgba(34, 197, 94, 0.2);
     border: 1px solid var(--green);
     color: var(--green);
+  }
+  .juncture-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    background: rgba(168, 85, 247, 0.25);
+    border: 1px solid var(--gold);
+    color: var(--gold);
   }
   .bars-grid {
     display: grid;
@@ -1268,23 +1713,39 @@ WORKBENCH_HTML = """<!DOCTYPE html>
 <body>
 <header>
   <div>
-    <h1>Qwen3.8-27B Stateful <code>&lt;think&gt;</code> Fork-Edit &amp; Subspace Probe Workbench</h1>
-    <div style="font-size:0.79rem;color:var(--muted);">
-      48 Gated DeltaNet (<code>ArraysCache</code> stride-8 snapshots) + 16 Gated Full-Attention (<code>KVCache</code>) | Monitor Heads: <code>L35.H21, L39.H1, L43.H7, L43.H1, L39.H0</code>
+    <h1>Qwen3.8-27B Stateful <code>&lt;think&gt;</code> Fork-Edit &amp; Rhythm Telemetry Workbench</h1>
+    <div style="font-size:0.78rem;color:var(--muted);">
+      48 Gated DeltaNet (<code>ArraysCache</code> stride-8) + 16 Full-Attention (384 Heads) | Lookback + Preplan (<code>WAAD_t</code>) + Anchor (<code>FAI_s</code>)
     </div>
   </div>
   <div>
     <span class="badge" id="statusBadge">Engine Ready</span>
     <span class="badge" id="snapBadge">Snapshots: -</span>
+    <span class="badge gold" id="spiBadge">SPI Traces: 0</span>
   </div>
 </header>
+
+<div class="mode-bar">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <span style="font-size:0.78rem;font-weight:700;color:var(--accent);">Telemetry Heatmap Mode:</span>
+    <div class="mode-tabs">
+      <button class="mode-btn active" id="modeBtn_lookback" onclick="setHeatmapMode('lookback')">1. Prompt Lookback (5-Head Audit)</button>
+      <button class="mode-btn" id="modeBtn_preplan" onclick="setHeatmapMode('preplan')">2. Preplan Rhythm (WAAD Onsets)</button>
+      <button class="mode-btn" id="modeBtn_anchor" onclick="setHeatmapMode('anchor')">3. Anchor Influence (FAI Hubs)</button>
+      <button class="mode-btn" id="modeBtn_coupled" onclick="setHeatmapMode('coupled')">4. Coupled Preplan&rarr;Anchor Junctures</button>
+    </div>
+  </div>
+  <div id="rhythmPeaksSummary" style="font-size:0.75rem;color:var(--muted);">
+    Peaks: Lookback=<code>-</code> | Preplan (WAAD)=<code>-</code> | Anchor (FAI)=<code>-</code> | Coupled Junctures=<code>0</code>
+  </div>
+</div>
 
 <div class="grid">
   <!-- LEFT PANEL -->
   <div class="card">
     <h2>
       <span>1. Baseline Prompt &amp; Organic / Custom <code>&lt;think&gt;</code> Trace</span>
-      <span id="prefillStats" style="font-size:0.76rem;color:var(--muted);"></span>
+      <span id="prefillStats" style="font-size:0.75rem;color:var(--muted);"></span>
     </h2>
     <label>User Prompt (System + User + <code>&lt;think&gt;\n</code>)</label>
     <textarea id="promptInput" rows="3">&lt;|im_start|&gt;system
@@ -1305,12 +1766,12 @@ Explain the mathematical relationship between Gated DeltaNet fast-weight linear 
       <button onclick="runPrefillAndProbe(false)">Prefill &amp; Probe &lt;think&gt;</button>
       <button class="organic" onclick="runPrefillAndProbe(true)">Generate Organic &lt;think&gt; (Auto-Decode + Probe)</button>
       <div style="display:flex;align-items:center;gap:5px;">
-        <span style="font-size:0.75rem;color:var(--muted);">Organic Toks:</span>
-        <input type="number" id="organicTokensInput" value="48" min="8" max="256" style="width:66px;padding:5px;" />
+        <span style="font-size:0.74rem;color:var(--muted);">Organic Toks:</span>
+        <input type="number" id="organicTokensInput" value="48" min="8" max="256" style="width:64px;padding:5px;" />
       </div>
       <div style="display:flex;align-items:center;gap:5px;">
-        <span style="font-size:0.75rem;color:var(--muted);">Organic &alpha;:</span>
-        <input type="number" id="organicAlphaInput" value="0.0" step="0.1" min="0.0" max="1.5" style="width:62px;padding:5px;" />
+        <span style="font-size:0.74rem;color:var(--muted);">Organic &alpha;:</span>
+        <input type="number" id="organicAlphaInput" value="0.0" step="0.1" min="0.0" max="1.5" style="width:60px;padding:5px;" />
       </div>
     </div>
 
@@ -1324,19 +1785,19 @@ Explain the mathematical relationship between Gated DeltaNet fast-weight linear 
   <!-- RIGHT PANEL -->
   <div class="card">
     <h2>
-      <span>2. Mid-<code>&lt;think&gt;</code> Stateful Fork-Edit &amp; Recursive Continuation</span>
-      <span id="forkStats" style="font-size:0.76rem;color:var(--green);"></span>
+      <span>2. Mid-<code>&lt;think&gt;</code> Stateful Fork-Edit &amp; Counterfactual SPI Logger</span>
+      <span id="forkStats" style="font-size:0.75rem;color:var(--green);"></span>
     </h2>
     <div class="row">
-      <div style="flex:1;min-width:110px;">
+      <div style="flex:1;min-width:105px;">
         <label>Fork Token Index (<code>fork_token_idx</code>)</label>
         <input type="number" id="forkIdxInput" value="46" min="1" />
       </div>
-      <div style="flex:1;min-width:100px;">
+      <div style="flex:1;min-width:95px;">
         <label>Projection Strength (<code>alpha</code>)</label>
         <input type="number" id="alphaInput" value="1.0" step="0.1" min="0.0" max="1.5" />
       </div>
-      <div style="flex:1;min-width:110px;">
+      <div style="flex:1;min-width:105px;">
         <label>Max New Tokens</label>
         <input type="number" id="maxNewTokensInput" value="64" step="8" min="0" max="512" />
       </div>
@@ -1354,7 +1815,7 @@ Explain the mathematical relationship between Gated DeltaNet fast-weight linear 
     <div class="row">
       <button class="secondary" onclick="runForkAndEdit()">Fork &amp; Edit from Token Index</button>
       <button class="promote" onclick="promoteForkToBaseline()">Promote Forked Stream to Left Baseline</button>
-      <span style="font-size:0.74rem;color:var(--muted);">Click ANY chip below (Edited or Continuation) to chain another fork!</span>
+      <button class="gold-btn" onclick="markLastSPITraceAccepted()">&#9733; Mark as Gold SPI Pair</button>
     </div>
 
     <label>Forked <code>&lt;think&gt;</code> Clause Chips (Click any chip to set <code>fork_token_idx</code>)</label>
@@ -1372,12 +1833,55 @@ Explain the mathematical relationship between Gated DeltaNet fast-weight linear 
 </div>
 
 <script>
-function heatColor(score) {
-  const s = Math.max(0, Math.min(1, score * 1.4));
+let currentHeatmapMode = 'lookback';
+let lastBaselineData = null;
+let lastForkData = null;
+let lastSPITraceId = null;
+
+function colorForMode(tok, mode) {
+  const lb = (tok.lookback_score !== undefined) ? tok.lookback_score : (tok.mean_lookback_score || 0.0);
+  const pre = tok.preplan_score || 0.0;
+  const anc = tok.anchor_score || 0.0;
+
+  if (mode === 'preplan') {
+    const s = Math.max(0, Math.min(1, pre));
+    const r = Math.round(16 + 30 * (1 - s));
+    const g = Math.round(45 + 155 * s);
+    const b = Math.round(75 + 175 * s);
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  if (mode === 'anchor') {
+    const s = Math.max(0, Math.min(1, anc));
+    const r = Math.round(40 + 205 * s);
+    const g = Math.round(28 + 145 * Math.pow(s, 1.3));
+    const b = Math.round(75 + 115 * (1 - s));
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  if (mode === 'coupled') {
+    if (tok.is_coupled_juncture) {
+      if (tok.juncture_role === 'preplan') return 'rgb(14, 165, 233)';
+      if (tok.juncture_role === 'anchor') return 'rgb(202, 138, 4)';
+      return 'rgb(168, 85, 247)';
+    }
+    const s = Math.max(0, Math.min(1, Math.max(pre, anc) * 0.5));
+    return `rgb(${Math.round(25 + 40 * s)}, ${Math.round(32 + 40 * s)}, ${Math.round(52 + 50 * s)})`;
+  }
+  // Default: 'lookback' (Red/Orange heatmap)
+  const s = Math.max(0, Math.min(1, lb * 1.4));
   const r = Math.round(30 + 215 * s);
   const g = Math.round(45 + 50 * (1 - s));
   const b = Math.round(90 * (1 - s));
   return `rgb(${r}, ${g}, ${b})`;
+}
+
+function setHeatmapMode(mode) {
+  currentHeatmapMode = mode;
+  ['lookback', 'preplan', 'anchor', 'coupled'].forEach(m => {
+    const btn = document.getElementById('modeBtn_' + m);
+    if (btn) btn.classList.toggle('active', m === mode);
+  });
+  if (lastBaselineData) renderBaselineChipsOnly(lastBaselineData);
+  if (lastForkData) renderForkChipsOnly(lastForkData);
 }
 
 function selectForkTokenChip(chipEl, tokenIdx) {
@@ -1388,14 +1892,30 @@ function selectForkTokenChip(chipEl, tokenIdx) {
 
 function makeInteractiveTokenChip(tok, peakTokenIdx) {
   const frag = document.createDocumentFragment();
-  const score = (tok.lookback_score !== undefined) ? tok.lookback_score : (tok.mean_lookback_score || 0.0);
+  const lb = (tok.lookback_score !== undefined) ? tok.lookback_score : (tok.mean_lookback_score || 0.0);
+  const pre = tok.preplan_score || 0.0;
+  const waad = tok.waad_raw || 0.0;
+  const anc = tok.anchor_score || 0.0;
+
   const chip = document.createElement('span');
-  chip.className = 'token-chip' + (peakTokenIdx !== null && tok.token_idx === peakTokenIdx ? ' spike' : '');
-  chip.style.background = heatColor(score);
-  chip.title = `idx=${tok.token_idx} | 5-Head Prompt Lookback=${score.toFixed(4)} | Local=${(tok.local_think_mass || 0).toFixed(4)}`;
+  let cls = 'token-chip';
+  if (peakTokenIdx !== null && tok.token_idx === peakTokenIdx) cls += ' spike';
+  if (tok.is_coupled_juncture) cls += ' coupled';
+  chip.className = cls;
+  chip.style.background = colorForMode(tok, currentHeatmapMode);
+
+  const coupledTag = tok.is_coupled_juncture ? ` | COUPLED (${tok.juncture_role || 'pair'})` : '';
+  chip.title = `idx=${tok.token_idx} | Lookback: ${lb.toFixed(2)} | Preplan (WAAD): ${pre.toFixed(2)} (${waad.toFixed(1)}t) | Anchor (FAI): ${anc.toFixed(2)}${coupledTag}`;
   chip.textContent = `${tok.text} [${tok.token_idx}]`;
   chip.onclick = () => selectForkTokenChip(chip, tok.token_idx);
   frag.appendChild(chip);
+
+  if (currentHeatmapMode === 'coupled' && tok.is_coupled_juncture) {
+    const jBadge = document.createElement('span');
+    jBadge.className = 'juncture-badge';
+    jBadge.textContent = tok.juncture_role === 'preplan' ? 'P→' : (tok.juncture_role === 'anchor' ? '→A' : 'P↔A');
+    frag.appendChild(jBadge);
+  }
 
   if (tok.is_think_end) {
     const badge = document.createElement('span');
@@ -1404,6 +1924,19 @@ function makeInteractiveTokenChip(tok, peakTokenIdx) {
     frag.appendChild(badge);
   }
   return frag;
+}
+
+function updateRhythmSummaryBanner(data) {
+  if (!data) return;
+  const lbPeak = data.peak_lookback_token_idx ?? (data.peak_spike_token ? data.peak_spike_token.token_idx : '-');
+  const prePeak = data.peak_preplan_token_idx ?? '-';
+  const ancPeak = data.peak_anchor_token_idx ?? '-';
+  const jCount = (data.coupled_junctures || []).length;
+  document.getElementById('rhythmPeaksSummary').innerHTML =
+    `Peaks: Lookback=<code>${lbPeak}</code> | Preplan (WAAD)=<code>${prePeak}</code> | Anchor (FAI)=<code>${ancPeak}</code> | Coupled Junctures=<code>${jCount}</code>`;
+  if (data.spi_traces_count !== undefined) {
+    document.getElementById('spiBadge').textContent = `SPI Traces: ${data.spi_traces_count}`;
+  }
 }
 
 function renderHeadBars(containerId, summary) {
@@ -1427,10 +1960,44 @@ function renderHeadBars(containerId, summary) {
   }
 }
 
+function activePeakForMode(data) {
+  if (!data) return null;
+  if (currentHeatmapMode === 'preplan') return data.peak_preplan_token_idx ?? null;
+  if (currentHeatmapMode === 'anchor') return data.peak_anchor_token_idx ?? null;
+  return data.peak_lookback_token_idx ?? (data.peak_spike_token ? data.peak_spike_token.token_idx : null);
+}
+
+function renderBaselineChipsOnly(data) {
+  const peakIdx = activePeakForMode(data);
+  const chipWrap = document.getElementById('baselineChips');
+  chipWrap.innerHTML = '';
+  (data.tokens || []).forEach(tok => {
+    if (!tok.is_think) return;
+    chipWrap.appendChild(makeInteractiveTokenChip(tok, peakIdx));
+  });
+}
+
+function renderForkChipsOnly(data) {
+  const peakIdx = activePeakForMode(data);
+  const forkWrap = document.getElementById('forkedChips');
+  forkWrap.innerHTML = '';
+  (data.edited_tokens || []).forEach(tok => {
+    forkWrap.appendChild(makeInteractiveTokenChip(tok, peakIdx));
+  });
+
+  const contWrap = document.getElementById('continuationChips');
+  contWrap.innerHTML = '';
+  (data.continuation_tokens || []).forEach(tok => {
+    contWrap.appendChild(makeInteractiveTokenChip(tok, peakIdx));
+  });
+}
+
 function renderBaselineData(data) {
+  lastBaselineData = data;
   document.getElementById('statusBadge').textContent =
     data.organic_generated ? `Organic <think> Ready (${data.model_id})` : `Ready (${data.model_id})`;
   document.getElementById('snapBadge').textContent = `Snapshots: [${data.snapshots.join(', ')}]`;
+  updateRhythmSummaryBanner(data);
   const peakIdx = data.peak_spike_token ? data.peak_spike_token.token_idx : null;
   const peakScore = data.peak_spike_token ? data.peak_spike_token.mean_lookback_score.toFixed(3) : '-';
   document.getElementById('prefillStats').textContent =
@@ -1440,12 +2007,7 @@ function renderBaselineData(data) {
   }
   document.getElementById('forkIdxInput').value = peakIdx !== null ? peakIdx : data.think_start_idx;
 
-  const chipWrap = document.getElementById('baselineChips');
-  chipWrap.innerHTML = '';
-  (data.tokens || []).forEach(tok => {
-    if (!tok.is_think) return;
-    chipWrap.appendChild(makeInteractiveTokenChip(tok, peakIdx));
-  });
+  renderBaselineChipsOnly(data);
   renderHeadBars('baselineBars', data.tail_16_summary);
 }
 
@@ -1487,26 +2049,18 @@ async function runForkAndEdit() {
     })
   });
   const data = await res.json();
-  document.getElementById('statusBadge').textContent = 'Fork Complete';
+  lastForkData = data;
+  lastSPITraceId = data.spi_trace_id || null;
+  document.getElementById('statusBadge').textContent = 'Fork Complete (Logged SPI Trace)';
   document.getElementById('snapBadge').textContent = `Snapshots: [${(data.snapshots || []).join(', ')}]`;
+  updateRhythmSummaryBanner(data);
   const gateNote = data.think_released_at_step !== null && data.think_released_at_step !== undefined
     ? ` | </think> α→0 @ +${data.think_released_at_step}t`
     : '';
   document.getElementById('forkStats').textContent =
     `fork=${data.fork_edit_ms} ms (snap=${data.snapshot_restored_idx}, +${data.delta_tokens_replayed}t) | dec=${data.decode_ms} ms | JSD=${data.jsd_vs_baseline.toFixed(4)}${gateNote}`;
 
-  const forkWrap = document.getElementById('forkedChips');
-  forkWrap.innerHTML = '';
-  (data.edited_tokens || []).forEach(tok => {
-    forkWrap.appendChild(makeInteractiveTokenChip(tok, null));
-  });
-
-  const contWrap = document.getElementById('continuationChips');
-  contWrap.innerHTML = '';
-  (data.continuation_tokens || []).forEach(tok => {
-    contWrap.appendChild(makeInteractiveTokenChip(tok, null));
-  });
-
+  renderForkChipsOnly(data);
   renderHeadBars('forkedBars', data.tail_16_summary);
   document.getElementById('continuationOutput').textContent = data.continuation_text || '';
 }
@@ -1518,6 +2072,28 @@ async function promoteForkToBaseline() {
   renderBaselineData(data);
   document.getElementById('statusBadge').textContent = 'Promoted Forked Stream to Left Baseline';
 }
+
+async function markLastSPITraceAccepted() {
+  const res = await fetch('/api/spi_traces/label', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ trace_id: lastSPITraceId, label: 'accepted' })
+  });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('statusBadge').textContent = `★ Marked SPI Trace ${data.trace_id.slice(0, 8)} as Gold ('accepted')`;
+  document.getElementById('spiBadge').textContent = `SPI Traces: ${data.count} (★ Gold Saved)`;
+}
+
+async function refreshSPITraceCount() {
+  try {
+    const res = await fetch('/api/spi_traces');
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById('spiBadge').textContent = `SPI Traces: ${data.count}`;
+  } catch (e) {}
+}
+refreshSPITraceCount();
 </script>
 </body>
 </html>
@@ -1530,7 +2106,7 @@ def create_harness_app(engine: SandboxEngine) -> FastAPI:
     """
     app = FastAPI(
         title="Qwen3.8-27B MLX Interpretability & Stateful <think> Fork-Edit Server",
-        version="1.1.0",
+        version="1.2.0",
     )
     app.state.engine = engine
 
@@ -1551,6 +2127,7 @@ def create_harness_app(engine: SandboxEngine) -> FastAPI:
                     "owned_by": "qwen38_sandbox",
                     "think_start_idx": eng.think_start_idx,
                     "snapshots": eng.timeline.list_snapshots(),
+                    "spi_traces_count": eng.spi_logger.count(),
                 }
             ],
         }
@@ -1645,6 +2222,7 @@ def create_harness_app(engine: SandboxEngine) -> FastAPI:
                 think_gated=req.think_gated,
                 max_new_tokens=req.max_new_tokens,
                 capture_probe=req.capture_probe,
+                label=req.label,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1666,6 +2244,19 @@ def create_harness_app(engine: SandboxEngine) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/spi_traces")
+    def api_list_spi_traces(limit: int = 25) -> Dict[str, Any]:
+        eng: SandboxEngine = app.state.engine
+        return eng.spi_logger.list_recent(limit=limit)
+
+    @app.post("/api/spi_traces/label")
+    def api_label_spi_trace(req: SPITraceLabelRequest) -> Dict[str, Any]:
+        eng: SandboxEngine = app.state.engine
+        try:
+            return eng.spi_logger.update_label(label=req.label, trace_id=req.trace_id)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     return app
 
 
@@ -1674,6 +2265,7 @@ def build_default_engine(
     vector_path: str = DEFAULT_VECTOR_PATH,
     prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
     snapshot_stride: int = DEFAULT_SNAPSHOT_STRIDE,
+    spi_log_path: Optional[Union[str, Path]] = None,
 ) -> SandboxEngine:
     """
     Load the local Qwen3.8-27B checkpoint (defaulting to `./models/Qwen3.8-27B-8bit-local`
@@ -1706,6 +2298,7 @@ def build_default_engine(
         model_id=model_name,
         prefill_step_size=prefill_step_size,
         snapshot_stride=snapshot_stride,
+        spi_log_path=spi_log_path,
     )
 
 
@@ -1743,6 +2336,12 @@ def parse_server_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespac
         default=DEFAULT_SNAPSHOT_STRIDE,
         help="Automatic Gated DeltaNet ArraysCache snapshot stride inside <think> (default: 8).",
     )
+    parser.add_argument(
+        "--spi-log-path",
+        type=str,
+        default=None,
+        help="Path to spi_traces.jsonl counterfactual trajectory log (default: ./outputs/spi_traces.jsonl).",
+    )
     return parser.parse_args(argv)
 
 
@@ -1754,6 +2353,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         model_path=args.model_path,
         vector_path=args.vector_path,
         snapshot_stride=args.snapshot_stride,
+        spi_log_path=args.spi_log_path,
     )
     app = create_harness_app(engine)
     uvicorn.run(app, host=args.host, port=args.port)

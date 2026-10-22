@@ -527,3 +527,280 @@ def attribute_top_heads_token_routing(
         )
 
     return attributions
+
+
+def _robust_normalize_01(values: List[float], eps: float = 1e-9) -> List[float]:
+    """
+    Normalize a 1D non-negative sequence into `[0.0, 1.0]` while preserving strict
+    monotonic ordering so the true peak uniquely reaches `1.0` and top-quartile chunk
+    onsets / anchors are not crushed by a single outlier.
+    """
+    if not values:
+        return []
+    n = len(values)
+    vmin = min(values)
+    vmax = max(values)
+    span = vmax - vmin
+    if span <= eps:
+        return [0.0 for _ in values]
+    sorted_vals = sorted(values)
+    p95_idx = min(n - 1, max(0, int(0.95 * (n - 1))))
+    p95_span = max(sorted_vals[p95_idx] - vmin, span * 0.5, eps)
+    out: List[float] = []
+    for v in values:
+        dv = max(0.0, v - vmin)
+        if dv <= p95_span or vmax <= sorted_vals[p95_idx] + eps:
+            # Linear up to 0.92 at p95 (or 1.0 if p95 == vmax)
+            top_cap = 1.0 if vmax <= sorted_vals[p95_idx] + eps else 0.92
+            out.append(min(1.0, (dv / p95_span) * top_cap))
+        else:
+            # Strictly monotonic tail from 0.92 -> 1.0 between p95 and vmax
+            tail_frac = (dv - p95_span) / max(span - p95_span, eps)
+            out.append(min(1.0, 0.92 + 0.08 * tail_frac))
+    max_out = max(out)
+    if max_out > eps:
+        return [min(1.0, max(0.0, x / max_out)) for x in out]
+    return out
+
+
+def compute_preplan_and_anchor_rhythm(
+    attn_maps: Dict[int, mx.array],
+    think_start_idx: int,
+    query_offset: Optional[int] = None,
+    window_w: int = 32,
+    horizon_lo: int = 2,
+    horizon_hi: int = 48,
+    eps: float = 1e-9,
+) -> Dict[str, Any]:
+    """
+    Compute task-agnostic Preplan (`WAAD_t`) and Anchor (`FAI_s`) structural rhythm telemetry
+    across the `<think>` trace `[think_start_idx .. N-1]` from the captured 16-layer
+    full-attention maps (`L = 16` layers, `H = 24` heads, total `384` heads), following
+    Li et al. ("Attention Illuminates LLM Reasoning: The Preplan-and-Anchor Rhythm").
+
+    Steps:
+      1. Sink-Free `<think>` Submatrix Normalization:
+         Extract the causal `<think>` submatrix `A_think^{(l,h)} in R^{M x M}` and
+         row-normalize over the causal lower triangle `j <= i` (`+ 1e-9` for stability).
+      2. Automatic Local vs. Global Head Classification:
+         Compute mean backward attention distance `d^{(l,h)}` for all `L * H` heads and
+         partition at the median into Locally Focused Heads (`H_loc`, bottom 50%) and
+         Globally Focused Heads (`H_glob`, top 50%).
+      3. Per-Token Preplan (`WAAD_i` & `Delta WAAD_i`) and Anchor (`FAI_j`) Scores:
+         - `WAAD_i = sum_{j=0}^i A_loc[i, j] * min(i - j, W)` (with `W = 32`)
+         - `Delta WAAD_i = |WAAD_i - WAAD_{min(i+1, M-1)}|`
+         - `FAI_j = (1 / |T(j)|) * sum_{i in T(j)} A_glob[i, j]` for `T(j) = [j + H_lo .. min(M-1, j + H_hi)]`
+         - Identify `peak_preplan_token_idx`, `peak_anchor_token_idx`, and coupled
+           `Preplan -> Anchor` junctures (top-quartile `preplan_score` followed within
+           `1..6` tokens by a top-quartile `anchor_score`).
+    """
+    if not attn_maps:
+        return {
+            "span_start_idx": int(think_start_idx),
+            "num_think_tokens": 0,
+            "num_total_heads": 0,
+            "num_local_heads": 0,
+            "num_global_heads": 0,
+            "median_head_distance": 0.0,
+            "local_heads": [],
+            "global_heads": [],
+            "waad_raw": [],
+            "delta_waad_raw": [],
+            "preplan_scores": [],
+            "fai_raw": [],
+            "anchor_scores": [],
+            "peak_preplan_token_idx": int(think_start_idx),
+            "peak_anchor_token_idx": int(think_start_idx),
+            "coupled_junctures": [],
+            "coupled_token_indices": [],
+            "juncture_roles": {},
+        }
+
+    sorted_layers = sorted(attn_maps.keys())
+    sample_mat = attn_maps[sorted_layers[0]]
+    q_len_raw = int(sample_mat.shape[-2])
+    k_len_raw = int(sample_mat.shape[-1])
+
+    inferred_q_offset = max(0, k_len_raw - q_len_raw) if query_offset is None else int(query_offset)
+    span_start = max(int(think_start_idx), inferred_q_offset)
+    q_skip = max(0, span_start - inferred_q_offset)
+    m_len = max(0, min(q_len_raw - q_skip, k_len_raw - span_start))
+
+    if m_len <= 0:
+        return {
+            "span_start_idx": int(span_start),
+            "num_think_tokens": 0,
+            "num_total_heads": 0,
+            "num_local_heads": 0,
+            "num_global_heads": 0,
+            "median_head_distance": 0.0,
+            "local_heads": [],
+            "global_heads": [],
+            "waad_raw": [],
+            "delta_waad_raw": [],
+            "preplan_scores": [],
+            "fai_raw": [],
+            "anchor_scores": [],
+            "peak_preplan_token_idx": int(span_start),
+            "peak_anchor_token_idx": int(span_start),
+            "coupled_junctures": [],
+            "coupled_token_indices": [],
+            "juncture_roles": {},
+        }
+
+    # 1. Extract M x M causal <think> submatrix across all (layer, head) pairs
+    submatrices: List[mx.array] = []
+    head_coords: List[Tuple[int, int]] = []
+    for l_idx in sorted_layers:
+        mat = attn_maps[l_idx].astype(mx.float32)  # (B, H, Q, K)
+        n_heads = int(mat.shape[1])
+        sub = mat[0, :, q_skip : q_skip + m_len, span_start : span_start + m_len]  # (H, M, M)
+        submatrices.append(sub)
+        for h_idx in range(n_heads):
+            head_coords.append((int(l_idx), int(h_idx)))
+
+    all_sub = mx.concatenate(submatrices, axis=0)  # (N_heads, M, M)
+    n_total_heads = int(all_sub.shape[0])
+
+    # Causal lower-triangular mask j <= i
+    i_idx = mx.arange(m_len, dtype=mx.float32)[:, None]
+    j_idx = mx.arange(m_len, dtype=mx.float32)[None, :]
+    causal_mask = (j_idx <= i_idx).astype(mx.float32)  # (M, M)
+
+    masked_sub = all_sub * causal_mask[None, :, :]
+    row_sums = mx.sum(masked_sub, axis=-1, keepdims=True) + float(eps)
+    a_tilde = masked_sub / row_sums  # (N_heads, M, M)
+
+    # 2. Automatic Local vs. Global Head Classification via mean backward distance d^{(l,h)}
+    dist_mat = mx.maximum(i_idx - j_idx, 0.0)  # (M, M)
+    # d^{(u)} = (1 / M) * sum_{i=0}^{M-1} sum_{j=0}^i a_tilde[u, i, j] * (i - j)
+    head_distances_arr = mx.mean(mx.sum(a_tilde * dist_mat[None, :, :], axis=-1), axis=-1)  # (N_heads,)
+    mx.eval(head_distances_arr)
+    head_distances = [float(x) for x in head_distances_arr.tolist()]
+
+    ranked_head_indices = sorted(range(n_total_heads), key=lambda u: (head_distances[u], u))
+    half_heads = max(1, n_total_heads // 2)
+    local_head_indices = ranked_head_indices[:half_heads]
+    global_head_indices = (
+        ranked_head_indices[half_heads:] if n_total_heads > 1 else ranked_head_indices
+    )
+    median_dist = float(head_distances[ranked_head_indices[half_heads - 1]])
+
+    a_loc = mx.mean(a_tilde[mx.array(local_head_indices, dtype=mx.int32)], axis=0)  # (M, M)
+    a_glob = mx.mean(a_tilde[mx.array(global_head_indices, dtype=mx.int32)], axis=0)  # (M, M)
+
+    # 3A. Compute Windowed Average Attention Distance (WAAD_i) & step-transition spike (Delta WAAD_i)
+    win_dist_mat = mx.minimum(dist_mat, float(window_w))  # min(i - j, W)
+    waad_arr = mx.sum(a_loc * win_dist_mat, axis=-1)  # (M,)
+    mx.eval(waad_arr, a_glob)
+    waad_raw = [float(x) for x in waad_arr.tolist()]
+
+    delta_waad_raw: List[float] = []
+    for i in range(m_len):
+        next_i = min(i + 1, m_len - 1)
+        delta_waad_raw.append(abs(waad_raw[i] - waad_raw[next_i]))
+
+    waad_norm = _robust_normalize_01(waad_raw, eps=eps)
+    delta_norm = _robust_normalize_01(delta_waad_raw, eps=eps)
+    combined_preplan = [0.65 * w_n + 0.35 * d_n for w_n, d_n in zip(waad_norm, delta_norm)]
+    preplan_scores = _robust_normalize_01(combined_preplan, eps=eps)
+
+    # 3B. Compute Future Attention Influence (FAI_j — Anchor Score)
+    a_glob_list: List[List[float]] = a_glob.tolist()
+    fai_raw: List[float] = []
+    h_lo = max(1, int(horizon_lo))
+    h_hi = max(h_lo, int(horizon_hi))
+
+    for j in range(m_len):
+        start_i = j + h_lo
+        end_i = min(m_len - 1, j + h_hi)
+        if start_i <= end_i:
+            t_count = end_i - start_i + 1
+            col_sum = sum(a_glob_list[i][j] for i in range(start_i, end_i + 1))
+            fai_raw.append(float(col_sum / t_count))
+        else:
+            # Fallback for final tail tokens where [j + H_lo .. M-1] is empty
+            if j + 1 < m_len:
+                fai_raw.append(float(a_glob_list[j + 1][j]) * 0.25)
+            else:
+                fai_raw.append(0.0)
+
+    anchor_scores = _robust_normalize_01(fai_raw, eps=eps)
+
+    # 4. Identify Peak Preplan Token, Peak Anchor Token, and Coupled Preplan -> Anchor Junctures
+    peak_preplan_rel = max(range(m_len), key=lambda i: preplan_scores[i])
+    peak_anchor_rel = max(range(m_len), key=lambda j: anchor_scores[j])
+    peak_preplan_token_idx = int(span_start + peak_preplan_rel)
+    peak_anchor_token_idx = int(span_start + peak_anchor_rel)
+
+    sorted_pre = sorted(preplan_scores)
+    sorted_anc = sorted(anchor_scores)
+    q75_idx = min(m_len - 1, max(0, int(0.75 * (m_len - 1))))
+    pre_q75 = max(sorted_pre[q75_idx], 0.50) if m_len >= 4 else 0.50
+    anc_q75 = max(sorted_anc[q75_idx], 0.50) if m_len >= 4 else 0.50
+
+    coupled_junctures: List[Dict[str, Any]] = []
+    coupled_set = set()
+    juncture_roles: Dict[int, str] = {}
+
+    for p_rel in range(m_len):
+        if preplan_scores[p_rel] < pre_q75:
+            continue
+        # Check if p_rel is a local maximum or top-quartile onset followed within 1..6 tokens by an anchor peak
+        search_hi = min(m_len - 1, p_rel + 6)
+        if p_rel + 1 > search_hi:
+            continue
+        best_a_rel: Optional[int] = None
+        best_a_score = -1.0
+        for a_rel in range(p_rel + 1, search_hi + 1):
+            if anchor_scores[a_rel] >= anc_q75 and anchor_scores[a_rel] > best_a_score:
+                best_a_score = anchor_scores[a_rel]
+                best_a_rel = a_rel
+        if best_a_rel is not None:
+            p_abs = int(span_start + p_rel)
+            a_abs = int(span_start + best_a_rel)
+            coupled_junctures.append(
+                {
+                    "preplan_idx": p_abs,
+                    "anchor_idx": a_abs,
+                    "distance": int(best_a_rel - p_rel),
+                    "preplan_score": round(float(preplan_scores[p_rel]), 4),
+                    "anchor_score": round(float(anchor_scores[best_a_rel]), 4),
+                }
+            )
+            coupled_set.add(p_abs)
+            coupled_set.add(a_abs)
+            juncture_roles[p_abs] = (
+                "both" if juncture_roles.get(p_abs) == "anchor" else "preplan"
+            )
+            juncture_roles[a_abs] = (
+                "both" if juncture_roles.get(a_abs) == "preplan" else "anchor"
+            )
+
+    return {
+        "span_start_idx": int(span_start),
+        "num_think_tokens": int(m_len),
+        "num_total_heads": int(n_total_heads),
+        "num_local_heads": len(local_head_indices),
+        "num_global_heads": len(global_head_indices),
+        "median_head_distance": round(median_dist, 4),
+        "local_heads": [
+            {"layer": head_coords[u][0], "head": head_coords[u][1], "mean_distance": round(head_distances[u], 4)}
+            for u in local_head_indices[:10]
+        ],
+        "global_heads": [
+            {"layer": head_coords[u][0], "head": head_coords[u][1], "mean_distance": round(head_distances[u], 4)}
+            for u in reversed(global_head_indices[-10:])
+        ],
+        "waad_raw": [round(float(x), 4) for x in waad_raw],
+        "delta_waad_raw": [round(float(x), 4) for x in delta_waad_raw],
+        "preplan_scores": [round(float(x), 4) for x in preplan_scores],
+        "fai_raw": [round(float(x), 6) for x in fai_raw],
+        "anchor_scores": [round(float(x), 4) for x in anchor_scores],
+        "peak_preplan_token_idx": peak_preplan_token_idx,
+        "peak_anchor_token_idx": peak_anchor_token_idx,
+        "coupled_junctures": coupled_junctures,
+        "coupled_token_indices": sorted(coupled_set),
+        "juncture_roles": juncture_roles,
+    }
+
